@@ -14,6 +14,7 @@ from .max_client import SessionRevoked, is_revoked
 from .delivery import Delivery
 from .interactions import Interactions
 from .formatting import from_max as max_entities, prepend, value
+from .queue_actions import QueueActions
 from .telegram import TelegramRejected
 
 log=logging.getLogger(__name__)
@@ -70,6 +71,7 @@ class Bridge:
         self.stopped=False
         self.delivery = Delivery(self)
         self.interactions = Interactions(self)
+        self.queue_actions = QueueActions(db, tg)
         self.delivery.interactions = self.interactions
         hub.on_event,hub.on_history=self.from_max,self.recover_history
 
@@ -126,7 +128,7 @@ class Bridge:
         thread=message.get('message_thread_id')
         d=await self.db.by_thread(owner,thread) if thread else None
         if not d:
-            raise Rejected('Эта тема не связана с MAX. Дождитесь входящего сообщения или используйте /help.')
+            raise Rejected('Этот топик не связан с MAX. Дождитесь входящего сообщения или используйте /help.')
         account=await self.db.account(owner)
         if not account or account['id']!=d['account_id']:
             raise Rejected('Аккаунт отключён.')
@@ -153,7 +155,7 @@ class Bridge:
         d=await self.db.by_thread(owner,message.get('message_thread_id'))
         mid=message.get('reply_to_message',{}).get('message_id')
         if not d or not mid:
-            raise Rejected('Ответьте командой /delete на своё сообщение в теме MAX.')
+            raise Rejected('Ответьте командой /delete на своё сообщение в топике MAX.')
         links=await self.db.links(d,'tg',mid)
         if not links or any(link['origin']!='tg' for link in links):
             raise Rejected('Удалять можно только собственные сообщения, отправленные этим мостом.')
@@ -164,7 +166,7 @@ class Bridge:
         if d['topic_state']=='ready' and d['tg_thread_id'] is not None:
             return d['tg_thread_id']
         if d['topic_state'] in ('creating','unknown'):
-            raise Rejected(f"Результат создания темы неизвестен. Найдите тему и отправьте в ней /bind {d['id']}. Не создавайте её повторно вслепую.")
+            raise Rejected(f"Результат создания топика неизвестен. Найдите его и отправьте в нём /bind {d['id']}.")
         await self.db.pool.execute("UPDATE dialogs SET topic_state='creating' WHERE id=$1 AND owner=$2",d['id'],d['owner'])
         title=self.db.vault.open(d['owner'],f"title:{d['account_id']}:{d['max_chat_id']}",bytes(d['title_cipher']))
         name=str(title).replace('\n',' ')[:95]+f" · {str(d['id'])[:8]}"
@@ -183,9 +185,8 @@ class Bridge:
 
     async def bind(self,owner,did,thread):
         if not thread:
-            raise Rejected('Команду /bind нужно отправить внутри существующей темы.')
+            raise Rejected('Команду /bind нужно отправить внутри существующего топика.')
         try:
-            import uuid
             did=uuid.UUID(did)
         except ValueError:
             raise Rejected('Неверный идентификатор диалога.') from None
@@ -194,9 +195,9 @@ class Bridge:
             if not d or d['topic_state'] not in ('unknown','pending'):
                 raise Rejected('Диалог не найден или уже привязан.')
             if await c.fetchval('SELECT 1 FROM dialogs WHERE owner=$1 AND tg_thread_id=$2',owner,thread):
-                raise Rejected('Эта тема уже используется другим диалогом.')
+                raise Rejected('Этот топик уже используется другим диалогом.')
             await c.execute("UPDATE dialogs SET tg_thread_id=$3,topic_state='ready' WHERE id=$1 AND owner=$2",did,owner,thread)
-        # Failed jobs remain paused until an explicit /retry; binding is not sending.
+        # Binding is not sending; failed jobs still require the Retry button.
 
     async def recover_history(self,entry):
         a=await self.db.account(entry.account['owner'])
@@ -285,11 +286,11 @@ class Bridge:
                 description=exc.description.lower()
                 if job['direction']=='tg' and 'message thread not found' in description:
                     await self.db.pool.execute("UPDATE dialogs SET topic_state='pending',tg_thread_id=NULL WHERE id=$1 AND owner=$2",job['dialog_id'],job['owner'])
-                    await self.db.state(job,'pending','Тема удалена; будет создана заново.',2)
+                    await self.db.state(job,'pending','Топик удалён; будет создан заново.',2)
                 elif job['direction']=='tg' and ('topic_closed' in description or 'topic is closed' in description):
                     with contextlib.suppress(Exception):
                         await self.tg.call('reopenForumTopic',{'chat_id':job['owner'],'message_thread_id':d['tg_thread_id']})
-                    await self.db.state(job,'failed','Тема закрыта. Откройте её и повторите задание.')
+                    await self.db.state(job,'failed','Топик закрыт. Откройте его и нажмите «Повторить».')
                 else:
                     await self.db.state(job,'failed',str(exc))
             except SessionRevoked as exc:
@@ -303,7 +304,7 @@ class Bridge:
                     await self.db.state(job, 'failed', str(SessionRevoked()))
                     continue
                 log.warning('Delivery failed (%s), job=%s',type(exc).__name__,job['id'])
-                await self.db.state(job,'unknown' if external else 'failed','Не удалось подтвердить результат.' if external else 'Ошибка подготовки сообщения. Используйте /retry после проверки /status.')
+                await self.db.state(job,'unknown' if external else 'failed','Не удалось подтвердить результат.' if external else 'Ошибка подготовки сообщения.')
 
     async def change(self,entry,d,job,p):
         return await self.delivery.change(entry,d,job,p)
@@ -311,24 +312,17 @@ class Bridge:
     async def notify_errors(self):
         for a in await self.db.pool.fetch("SELECT id,owner FROM accounts WHERE status='reauth' AND NOT reauth_notified"):
             try:
-                await self.tg.text(a['owner'], 'Подключение MAX остановлено: сессия отозвана или больше не действует.\nДля повторного входа: /disconnect, затем /connect.\nАвтоматически запрашивать SMS бот не будет.')
+                await self.tg.text(a['owner'], 'Сессия MAX отозвана. Войдите заново: /disconnect → /connect.')
             except Exception:
                 continue
             await self.db.pool.execute("UPDATE accounts SET reauth_notified=true WHERE id=$1 AND owner=$2 AND status='reauth'", a['id'], a['owner'])
-        rows=await self.db.pool.fetch("""SELECT j.*,d.tg_thread_id FROM jobs j JOIN dialogs d ON d.id=j.dialog_id
+        rows=await self.db.pool.fetch("""SELECT j.*,d.tg_thread_id FROM jobs j
+            JOIN dialogs d ON d.id=j.dialog_id AND d.owner=j.owner
             WHERE j.status IN ('failed','unknown','skipped') AND j.error IS NOT NULL AND NOT j.notified
             ORDER BY j.id LIMIT 20""")
-        for j in rows:
-            text=f"Доставка #{j['id']}: {j['error']}\n/retry {j['id']} — повторить, /skip {j['id']} — пропустить."
-            if j['status']=='unknown':
-                text+='\nРезультат неизвестен. Проверьте MAX/Telegram; повтор может создать дубль.'
+        for job in rows:
             try:
-                await self.tg.text(j['owner'],text,j['tg_thread_id'])
-            except TelegramRejected:
-                try:
-                    await self.tg.text(j['owner'],text)
-                except Exception:
-                    continue
-            except Exception:
-                continue
-            await self.db.pool.execute('UPDATE jobs SET notified=true WHERE id=$1 AND owner=$2',j['id'],j['owner'])
+                await self.queue_actions.notify(job)
+            except Exception as exc:
+                # Notifications cannot hold up delivery; retry only the notice later.
+                log.warning('Delivery notice failed (%s), job=%s', type(exc).__name__, job['id'])

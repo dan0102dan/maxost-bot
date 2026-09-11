@@ -89,23 +89,8 @@ class Media:
         from pymax import File, Photo, Video, VideoNote, Voice
         raw=await self.tg.download(a['file_id'],self.limit)
         kind=a['kind']
+        # Telegram stickers have no MAX sticker ID. Send the original file as-is.
         klass={'photo':Photo,'video':Video,'animation':Video,'video_note':VideoNote,'voice':Voice}.get(kind,File)
-        if kind == 'sticker' and not a.get('is_animated') and not a.get('is_video'):
-            # Arbitrary Telegram sticker sets do not have MAX sticker identifiers.
-            # Keep the visible artwork; never upload TGS as if it were a photo.
-            import io
-            from PIL import Image, UnidentifiedImageError
-            try:
-                with Image.open(io.BytesIO(raw)) as image:
-                    if image.width * image.height > 4_000_000:
-                        raise Rejected('Изображение стикера слишком большое.')
-                    target = io.BytesIO()
-                    image.convert('RGBA').save(target, format='PNG')
-                    raw = target.getvalue()
-                    a = {**a, 'name': 'sticker.png'}
-                    klass = Photo
-            except (UnidentifiedImageError, OSError, ValueError):
-                raise Rejected('Не удалось декодировать стикер Telegram.') from None
         kwargs={'raw':raw,'name':safe_name(a['name'])}
         if kind in ('voice','video_note'):
             kwargs['duration']=a.get('duration',0)
@@ -136,8 +121,7 @@ class Media:
             if getattr(a,'lottie_url',None):
                 import gzip
                 raw = await self.download(a.lottie_url)
-                # Telegram TGS is gzipped Lottie. It can reject unsupported animation features;
-                # the delivery layer then sends the original as a clearly labelled document.
+                # Telegram TGS is gzipped Lottie. Keep a document fallback.
                 if not raw.startswith(b'\x1f\x8b'):
                     raw = gzip.compress(raw, mtime=0)
                 return 'sticker','sticker.tgs',raw

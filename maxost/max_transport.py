@@ -1,8 +1,7 @@
 """Version-pinned MAX wire adapter for explicit entities and attachment edits.
 
-PyMax's public send/edit methods parse Markdown. We deliberately use the same
-payload models and RPCs as its MessageService instead of changing literal text.
-See docs/compatibility.md for the exact upstream revision.
+Use the pinned MessageService payloads without reparsing literal user text or
+adding transport/conversion notices to it.
 """
 from __future__ import annotations
 
@@ -16,16 +15,13 @@ from .max_client import SessionRevoked, is_revoked
 async def prepare(client, media, payload):
     from pymax.types.domain.attachments.poll import Poll
     items = []
-    notes = []
     for attachment in payload.get('attachments', []):
         if attachment['kind'] == 'poll':
             data = attachment['poll']
             items.append(Poll(title=data['title'], answers=data['answers'], settings=data['settings']))
         else:
             items.append(await media.for_max(attachment))
-            if attachment['kind'] == 'sticker':
-                notes.append('Стикер Telegram: изображение/файл, не элемент набора MAX.')
-    return await client._app.api.messages._upload_attachments(items), notes
+    return await client._app.api.messages._upload_attachments(items)
 
 
 async def transmit(client, chat_id, part, attachments, reply=None, message_id=None):
@@ -37,10 +33,8 @@ async def transmit(client, chat_id, part, attachments, reply=None, message_id=No
     from pymax.protocol import Opcode
     from pymax.types.domain import Message
 
-    elements, notes = to_max(part['text'], part.get('entities', []))
+    elements, _ = to_max(part['text'], part.get('entities', []))
     text = part['text']
-    if notes:
-        text += '\n[Формат Telegram без аналога MAX: ' + ', '.join(notes) + ']'
     app = client._app
     if message_id is None:
         frame = SendMessagePayload(chat_id=chat_id, message=SendMessagePayloadMessage(
@@ -60,8 +54,7 @@ async def transmit(client, chat_id, part, attachments, reply=None, message_id=No
         except ApiError as exc:
             if exc.error != 'attachment.not.ready':
                 raise
-            # A definitive rejection is safe to retry after MAX completes processing.
-            # Reuse the same cid/payload, never generate a second logical message.
+            # This definitive rejection is safe to retry with the same cid/payload.
             await app.api.messages._process_attachment_error(attachments)
             response = await app.invoke(opcode, frame.to_payload())
         message = bind_api_model(app, require_payload_model(response, Message) if message_id is None else require_payload_item_model(response, MessagePayloadKey.MESSAGE, Message))

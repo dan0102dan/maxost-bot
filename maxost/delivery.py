@@ -201,7 +201,7 @@ class Delivery:
             kind = 'document'
             result = await self.tg.call(
                 'sendDocument',
-                {**params, 'caption': '[Стикер MAX: исходный файл]'},
+                {**params, 'caption': unit['text'], 'caption_entities': unit['entities']},
                 files={'document': (name, raw)},
             )
         return [{
@@ -244,14 +244,7 @@ class Delivery:
             await self.send_max(entry, dialog, job, normalized, reply)
 
     async def send_max(self, entry, dialog, job, payload, reply, old=None):
-        prepared, notes = await max_transport.prepare(
-            entry.client, self.media, payload
-        )
-        if notes:
-            payload = {
-                **payload,
-                'text': payload['text'] + '\n[' + ' '.join(sorted(set(notes))) + ']',
-            }
+        prepared = await max_transport.prepare(entry.client, self.media, payload)
         parts = chunks(payload['text'], payload['entities'])
         tg_ids = payload.get('tg_ids') or [int(job['source_id'])]
         old = old or []

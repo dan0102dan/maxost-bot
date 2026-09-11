@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .content_store import ContentStore
 from .errors import Rejected
+from .queue_actions import job_version
 
 
 class Database(ContentStore):
@@ -202,22 +203,44 @@ class Database(ContentStore):
 
     async def claim(self):
         await self.flush_albums()
-        return await self.pool.fetchrow(
-            '''WITH next AS (
-                SELECT j.id FROM jobs j
-                JOIN dialogs d ON d.id=j.dialog_id
-                JOIN accounts a ON a.id=d.account_id
-                WHERE j.status='pending' AND j.available_at<=now()
-                  AND a.status IN ('connected','offline')
-                  AND NOT EXISTS (
-                    SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
-                    AND prev.direction=j.direction AND prev.id<j.id
-                    AND prev.status NOT IN ('sent','skipped'))
-                ORDER BY j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
+        # Lock the dialog before choosing a job. A retry can requeue an older ID;
+        # its claim must never overlap a newer in-flight job in the same direction.
+        async with self.pool.acquire() as connection, connection.transaction():
+            dialog = await connection.fetchrow(
+                '''SELECT d.id FROM dialogs d JOIN accounts a ON a.id=d.account_id
+                WHERE a.status IN ('connected','offline') AND EXISTS (
+                    SELECT 1 FROM jobs j
+                    WHERE j.dialog_id=d.id AND j.owner=d.owner
+                    AND j.status='pending' AND j.available_at<=now()
+                    AND NOT EXISTS (
+                        SELECT 1 FROM jobs active WHERE active.dialog_id=j.dialog_id
+                        AND active.direction=j.direction
+                        AND active.status IN ('claimed','sending'))
+                    AND (j.direction='tg' OR NOT EXISTS (
+                        SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
+                        AND prev.direction=j.direction AND prev.id<j.id
+                        AND prev.status NOT IN ('sent','skipped'))))
+                ORDER BY d.created_at,d.id FOR UPDATE OF d SKIP LOCKED LIMIT 1'''
             )
-            UPDATE jobs SET status='claimed',updated_at=now()
-            FROM next WHERE jobs.id=next.id RETURNING jobs.*'''
-        )
+            if dialog is None:
+                return None
+            # READ COMMITTED gets a fresh snapshot after taking the dialog lock.
+            return await connection.fetchrow(
+                '''WITH next AS (
+                    SELECT j.id FROM jobs j
+                    WHERE j.dialog_id=$1 AND j.status='pending' AND j.available_at<=now()
+                    AND NOT EXISTS (
+                        SELECT 1 FROM jobs active WHERE active.dialog_id=j.dialog_id
+                        AND active.direction=j.direction
+                        AND active.status IN ('claimed','sending'))
+                    AND (j.direction='tg' OR NOT EXISTS (
+                        SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
+                        AND prev.direction=j.direction AND prev.id<j.id
+                        AND prev.status NOT IN ('sent','skipped')))
+                    ORDER BY j.id FOR UPDATE SKIP LOCKED LIMIT 1
+                ) UPDATE jobs SET status='claimed',updated_at=now()
+                FROM next WHERE jobs.id=next.id RETURNING jobs.*''', dialog['id'],
+            )
 
     async def state(self, job, status, error=None, delay=0):
         await self.pool.execute(
@@ -263,33 +286,35 @@ class Database(ContentStore):
             value,
         )
 
-    async def queue_control(self, owner, job_id, action, confirm=False):
+    async def queue_control(self, owner, job_id, action, *, expected, confirm=False):
+        if action not in ('retry', 'skip'):
+            raise Rejected('Действие недоступно.')
         async with self.pool.acquire() as connection, connection.transaction():
+            # Same dialog -> job lock order as ingestion, claim and album assembly.
+            dialog_id = await connection.fetchval(
+                '''SELECT d.id FROM dialogs d JOIN jobs j
+                ON j.dialog_id=d.id AND j.owner=d.owner
+                WHERE j.id=$1 AND j.owner=$2 FOR UPDATE OF d''', job_id, owner,
+            )
+            if dialog_id is None:
+                raise Rejected('Это действие уже недоступно.')
             job = await connection.fetchrow(
                 'SELECT * FROM jobs WHERE owner=$1 AND id=$2 FOR UPDATE',
-                owner,
-                job_id,
+                owner, job_id,
             )
-            if not job or job['status'] not in ('failed', 'unknown'):
-                raise Rejected('Задание не найдено или уже обрабатывается.')
+            if (not job or job['status'] not in ('failed', 'unknown')
+                    or job_version(job) != expected):
+                raise Rejected('Это действие уже недоступно.')
             if action == 'retry' and job['payload'] is None:
-                raise Rejected(
-                    'Срок хранения содержимого истёк. Отправьте сообщение заново.'
-                )
+                raise Rejected('Срок хранения истёк. Отправьте сообщение заново.')
             if action == 'retry' and job['status'] == 'unknown' and not confirm:
-                raise Rejected(
-                    f'Возможен дубль. Проверьте переписку, затем '
-                    f'/retry {job_id} confirm или /skip {job_id}.'
-                )
+                raise Rejected('Подтвердите повтор кнопкой: возможен дубль.')
             state = 'pending' if action == 'retry' else 'skipped'
             await connection.execute(
                 '''UPDATE jobs SET status=$3,error=NULL,notified=false,
                 available_at=now(),updated_at=now(),
                 payload=CASE WHEN $3='skipped' THEN NULL ELSE payload END
-                WHERE id=$1 AND owner=$2''',
-                job_id,
-                owner,
-                state,
+                WHERE id=$1 AND owner=$2''', job_id, owner, state,
             )
 
     async def set_offset(self, value):

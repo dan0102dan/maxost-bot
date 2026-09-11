@@ -50,16 +50,7 @@ class Application:
             owner,
         )
         counts = {row['status']: row['n'] for row in rows}
-        failed = []
-        if counts.get('failed') or counts.get('unknown'):
-            failed = await self.db.pool.fetch(
-                "SELECT id,status FROM jobs WHERE owner=$1 "
-                "AND status IN ('failed','unknown') ORDER BY id LIMIT 10",
-                owner,
-            )
-        await self.tg.text(
-            owner, status_text(account['status'], counts, failed), thread
-        )
+        await self.tg.text(owner, status_text(account['status'], counts), thread)
 
     async def command(self, owner, text, message=None):
         args = text.split()
@@ -79,32 +70,12 @@ class Application:
             await self.status(owner, thread)
         elif command == '/help':
             await self.tg.text(owner, HELP, thread)
-        elif command in ('/retry', '/skip'):
-            try:
-                job_id = int(args[1])
-                if not 0 < job_id < 2**63:
-                    raise ValueError()
-            except (ValueError, IndexError):
-                raise Rejected(
-                    'Укажите номер: /retry 123 или /skip 123.'
-                ) from None
-            await self.db.queue_control(
-                owner,
-                job_id,
-                command[1:],
-                len(args) > 2 and args[2] == 'confirm',
-            )
-            await self.tg.text(
-                owner,
-                'Повторяем отправку.' if command == '/retry' else 'Сообщение пропущено.',
-                thread,
-            )
         elif command == '/bind':
             if len(args) != 2:
                 raise Rejected('Отправьте /bind UUID в нужном топике.')
             await self.bridge.bind(owner, args[1], thread)
             await self.tg.text(
-                owner, 'Топик привязан. Повторить отправку: /retry N.', thread
+                owner, 'Топик привязан. Нажмите «Повторить» под ошибкой.', thread
             )
         elif command == '/delete':
             if not message:
@@ -126,6 +97,9 @@ class Application:
                 return
             try:
                 data = query.get('data', '')
+                if data.startswith('dq:'):
+                    await self.bridge.queue_actions.callback(query)
+                    return
                 if data.startswith('np:'):
                     await self.bridge.interactions.native_polls.callback(query)
                     return
