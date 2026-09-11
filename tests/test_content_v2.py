@@ -210,7 +210,7 @@ def sample_poll():
 def test_poll_card_shows_real_counts_and_versioned_buttons():
     poll = sample_poll()
     text, keyboard = poll_view(1, poll)
-    assert 'Всего голосов в MAX: 9' in text
+    assert 'Голосов в MAX: 9' in text
     assert 'A — 9' in text
     assert all(len(b['callback_data'].encode()) <= 64 for r in keyboard['inline_keyboard'] for b in r)
     changed = copy.deepcopy(poll)

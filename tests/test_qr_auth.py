@@ -128,7 +128,7 @@ def test_auth_ui_offers_qr_before_and_after_sms_request():
     phone_json = json.dumps(card(phone), ensure_ascii=False)
     code_json = json.dumps(card(code), ensure_ascii=False)
     assert 'Войти по QR' in phone_json
-    assert 'Код не пришёл — войти по QR' in code_json
+    assert 'Нет кода? Войти по QR' in code_json
     assert f'a:{phone.nonce}:phone:qr' in phone_json
     assert f'a:{code.nonce}:code:qr' in code_json
 
