@@ -7,15 +7,30 @@ import logging
 from dataclasses import dataclass, field
 
 from .errors import Rejected, RetryLater, Uncertain
+from .max_auth import InteractiveLogin, InteractiveQrLogin
 from .session_store import PostgresSessionStore
 
 log = logging.getLogger(__name__)
 
 
+class SessionRevoked(Rejected):
+    def __init__(self):
+        super().__init__(
+            'Сессия MAX отозвана. Нужна повторная авторизация: /disconnect, затем /connect.'
+        )
+
+
+def is_revoked(exc):
+    return isinstance(exc, SessionRevoked) or any(
+        getattr(exc, name, None) in ('FAIL_LOGIN_TOKEN', 'FAIL_LOGOUT_ALL')
+        for name in ('error', 'message')
+    )
+
+
 class NoInteractiveLogin:
     async def authenticate(self, app):
-        # Never request another SMS automatically on a server restart.
-        raise Rejected('Требуется повторный вход: /disconnect, затем /connect.')
+        # Never request another SMS or QR automatically on a server restart.
+        raise SessionRevoked()
 
 
 @dataclass
@@ -28,6 +43,14 @@ class Connection:
     closing: bool = False
 
 
+def _account_kind(account) -> str:
+    try:
+        kind = account['client_kind']
+    except (KeyError, TypeError):
+        kind = 'mobile'
+    return kind if kind in ('mobile', 'web') else 'mobile'
+
+
 class MaxHub:
     def __init__(self, db, settings):
         self.db, self.settings = db, settings
@@ -35,22 +58,38 @@ class MaxHub:
         self.on_event = None
         self.on_history = None
 
-    def build(self, entry, provider=None):
-        from pymax import Client, ExtraConfig
+    def build(self, entry, provider=None, kind=None):
+        from pymax import Client, ExtraConfig, WebClient
+
         a = entry.account
-        phone = self.db.vault.open(a['owner'], f"phone:{a['id']}", bytes(a['phone_cipher']))
-        client = Client(
-            phone=phone, work_dir='/tmp',
-            sms_code_provider=provider, password_provider=provider,
-            auth_flow=None if provider else NoInteractiveLogin(),
-            extra_config=ExtraConfig(
-                store=PostgresSessionStore(self.db, a['id'], a['owner']),
-                persist_session=True, reconnect=False, relogin=False,
-                password_max_attempts=3, log_level='CRITICAL',
-            ),
+        kind = kind or _account_kind(a)
+        config = ExtraConfig(
+            store=PostgresSessionStore(self.db, a['id'], a['owner']),
+            persist_session=True,
+            reconnect=False,
+            relogin=False,
+            password_max_attempts=3,
+            log_level='CRITICAL',
         )
-        # Upstream logging may contain protocol payloads on failures. Disable its
-        # entire hierarchy, including loggers created by future Client instances.
+        if kind == 'web':
+            client = WebClient(
+                work_dir='/tmp',
+                auth_flow=InteractiveQrLogin(provider) if provider else NoInteractiveLogin(),
+                extra_config=config,
+            )
+        else:
+            phone = self.db.vault.open(
+                a['owner'], f"phone:{a['id']}", bytes(a['phone_cipher'])
+            )
+            client = Client(
+                phone=phone,
+                work_dir='/tmp',
+                sms_code_provider=provider,
+                password_provider=provider,
+                auth_flow=InteractiveLogin(provider) if provider else NoInteractiveLogin(),
+                extra_config=config,
+            )
+
         for name, logger in logging.Logger.manager.loggerDict.items():
             if name.startswith('pymax') and isinstance(logger, logging.Logger):
                 logger.disabled = True
@@ -62,8 +101,13 @@ class MaxHub:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    # No exception text, repr(event), phone, token or raw update.
-                    log.warning('MAX event processing failed (%s); history recovery will retry new messages', type(exc).__name__)
+                    if is_revoked(exc):
+                        await self.reauth(entry)
+                        return
+                    log.warning(
+                        'MAX event processing failed (%s); history recovery will retry new messages',
+                        type(exc).__name__,
+                    )
 
         @client.on_message()
         async def message(event, _client):
@@ -77,22 +121,53 @@ class MaxHub:
         async def delete(event, _client):
             await dispatch('delete', event)
 
+        @client.on_reaction_update()
+        async def reaction(event, _client):
+            await dispatch('reaction', event)
+
         return client
 
-    async def authenticate(self, account, provider):
+    async def reauth(self, entry):
+        entry.closing = True
+        entry.ready.clear()
+        await self.db.pool.execute(
+            """UPDATE accounts SET status='reauth',session_cipher=NULL,
+            reauth_notified=CASE WHEN status='reauth' THEN reauth_notified ELSE false END
+            WHERE id=$1 AND owner=$2""",
+            entry.account['id'],
+            entry.account['owner'],
+        )
+        if entry.client:
+            with contextlib.suppress(Exception):
+                await entry.client.close()
+
+    async def authenticate(self, account, provider, kind=None):
+        kind = kind or getattr(provider, 'client_kind', 'mobile')
+        if kind not in ('mobile', 'web'):
+            raise ValueError('Unsupported MAX client kind')
         entry = Connection(account)
         self.connections[account['id']] = entry
-        entry.client = self.build(entry, provider)
         try:
+            entry.client = self.build(entry, provider, kind)
+            updated = await self.db.pool.execute(
+                'UPDATE accounts SET client_kind=$3 WHERE id=$1 AND owner=$2',
+                account['id'],
+                account['owner'],
+                kind,
+            )
+            if updated != 'UPDATE 1':
+                raise Rejected('Подключение отменено.')
+            account = await self.db.account(account['owner'])
+            entry.account = account
             await entry.client.connect()
             await self.identify(entry)
         except BaseException:
-            # A successfully issued but unbound session must not remain running.
             with contextlib.suppress(Exception):
-                if entry.client.is_connected:
+                if entry.client and entry.client.is_connected:
                     await entry.client.logout()
             with contextlib.suppress(Exception):
-                await entry.client.close()
+                if entry.client:
+                    await entry.client.close()
             self.connections.pop(account['id'], None)
             raise
         entry.task = asyncio.create_task(self.monitor(entry, connected=True))
@@ -111,7 +186,9 @@ class MaxHub:
         entry.ready.set()
 
     async def restore(self):
-        for account in await self.db.pool.fetch("SELECT * FROM accounts WHERE status IN ('offline','connected')"):
+        for account in await self.db.pool.fetch(
+            "SELECT * FROM accounts WHERE status IN ('offline','connected')"
+        ):
             entry = Connection(account)
             self.connections[account['id']] = entry
             entry.task = asyncio.create_task(self.monitor(entry))
@@ -126,18 +203,24 @@ class MaxHub:
                         await entry.client.connect()
                         await self.identify(entry)
                     delay, connected = 2, False
-                    # A periodic history pass also recovers a failed live-event DB write.
                     while entry.client.is_connected and not entry.closing:
                         if self.on_history:
                             try:
                                 async with entry.gate:
                                     await self.on_history(entry)
                             except Exception as exc:
-                                log.warning('MAX history recovery deferred (%s)', type(exc).__name__)
+                                if is_revoked(exc):
+                                    raise
+                                log.warning(
+                                    'MAX history recovery deferred (%s)',
+                                    type(exc).__name__,
+                                )
                         for _ in range(self.settings.history_interval):
                             await asyncio.sleep(1)
                             if not entry.client.is_connected or entry.closing:
                                 break
+                    if entry.closing:
+                        return
                     raise ConnectionError('connection closed')
                 except asyncio.CancelledError:
                     raise
@@ -146,13 +229,20 @@ class MaxHub:
                     with contextlib.suppress(Exception):
                         if entry.client:
                             await entry.client.close()
-                    # API rejection while connecting is not a network retry or an
-                    # invitation to request more SMS. The owner must reconnect.
-                    terminal = isinstance(exc, Rejected) or type(exc).__name__ in ('ApiError','PasswordAttemptsExceededError')
+                    terminal = isinstance(exc, Rejected) or type(exc).__name__ in (
+                        'ApiError',
+                        'PasswordAttemptsExceededError',
+                    )
                     status = 'reauth' if terminal else 'offline'
-                    await self.db.pool.execute('UPDATE accounts SET status=$3 WHERE id=$1 AND owner=$2', entry.account['id'], entry.account['owner'], status)
+                    await self.db.pool.execute(
+                        'UPDATE accounts SET status=$3 WHERE id=$1 AND owner=$2',
+                        entry.account['id'],
+                        entry.account['owner'],
+                        status,
+                    )
                     log.warning('MAX connection %s (%s)', status, type(exc).__name__)
                     if terminal:
+                        await self.reauth(entry)
                         return
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, 60)
@@ -164,7 +254,12 @@ class MaxHub:
 
     def get(self, account_id, owner):
         entry = self.connections.get(account_id)
-        if not entry or entry.account['owner'] != owner or entry.closing or not entry.ready.is_set():
+        if (
+            not entry
+            or entry.account['owner'] != owner
+            or entry.closing
+            or not entry.ready.is_set()
+        ):
             raise RetryLater('MAX сейчас недоступен; сообщение осталось в очереди.', 10)
         return entry
 
@@ -173,11 +268,15 @@ class MaxHub:
         if not account:
             return True
         entry = self.connections.get(account['id'])
-        await self.db.pool.execute("UPDATE accounts SET status='paused' WHERE id=$1 AND owner=$2", account['id'], owner)
-        revoked = False
         if entry:
             entry.closing = True
-            # Let a started delivery finish before revoking and deleting mappings.
+        await self.db.pool.execute(
+            "UPDATE accounts SET status='paused' WHERE id=$1 AND owner=$2",
+            account['id'],
+            owner,
+        )
+        revoked = False
+        if entry:
             async with entry.gate:
                 try:
                     if entry.client and entry.client.is_connected:
@@ -192,7 +291,9 @@ class MaxHub:
                 with contextlib.suppress(Exception):
                     await entry.client.close()
             self.connections.pop(account['id'], None)
-        await self.db.pool.execute('DELETE FROM accounts WHERE id=$1 AND owner=$2', account['id'], owner)
+        await self.db.pool.execute(
+            'DELETE FROM accounts WHERE id=$1 AND owner=$2', account['id'], owner
+        )
         await self.db.pool.execute('DELETE FROM users WHERE id=$1', owner)
         return revoked
 
@@ -202,7 +303,9 @@ class MaxHub:
             entry.closing = True
             if entry.task:
                 entry.task.cancel()
-        await asyncio.gather(*(e.task for e in entries if e.task), return_exceptions=True)
+        await asyncio.gather(
+            *(e.task for e in entries if e.task), return_exceptions=True
+        )
         for entry in entries:
             if entry.client:
                 with contextlib.suppress(Exception):
@@ -216,6 +319,12 @@ async def mutate(client, method, **kwargs):
     except asyncio.CancelledError:
         raise
     except Exception as exc:
+        if is_revoked(exc):
+            raise SessionRevoked() from None
         if type(exc).__name__ == 'ApiError':
-            raise Rejected('MAX отклонил действие. Проверьте доступность диалога и /status.') from None
-        raise Uncertain('Ответ MAX не получен. Проверьте переписку перед повторной отправкой.') from None
+            raise Rejected(
+                'MAX отклонил действие. Проверьте доступность диалога и /status.'
+            ) from None
+        raise Uncertain(
+            'Ответ MAX не получен. Проверьте переписку перед повторной отправкой.'
+        ) from None

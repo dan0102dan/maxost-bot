@@ -6,10 +6,14 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 
-from .content import from_telegram, is_dialog, split_text
+from .content import from_telegram, is_dialog, supported_chat, chat_kind, can_publish
 from .errors import Rejected, RetryLater, Uncertain
-from .max_client import mutate
+from .max_client import SessionRevoked, is_revoked
+from .delivery import Delivery
+from .interactions import Interactions
+from .formatting import from_max as max_entities, prepend, value
 from .telegram import TelegramRejected
 
 log=logging.getLogger(__name__)
@@ -26,28 +30,37 @@ def revision(payload):
 
 
 def normalize_max(message):
-    if getattr(message,'ttl',False):
-        return [{'text':'[Временное сообщение MAX: содержимое не копируется]'}]
-    text=getattr(message,'text',None) or ''
-    parts=[{'text':s} for s in split_text(text)] if text else []
-    for index,a in enumerate(getattr(message,'attaches',[]) or []):
-        kind=str(getattr(getattr(a,'type',None),'value',getattr(a,'type',''))).upper()
-        if kind in ('PHOTO','FILE','VIDEO','AUDIO'):
-            parts.append({'text':'','attachment':{'index':index,'kind':kind}})
+    if getattr(message, 'ttl', False):
+        return [{'text': '[Временное сообщение MAX: содержимое не копируется]', 'entities': [], 'attachments': []}]
+    text = getattr(message, 'text', None) or ''
+    entities, unsupported = max_entities(text, getattr(message, 'elements', []))
+    attachments = []
+    poll_seen = False
+    for index, a in enumerate(getattr(message, 'attaches', []) or []):
+        kind = str(getattr(value(a, 'type'), 'value', value(a, 'type', ''))).upper()
+        if kind in ('PHOTO', 'FILE', 'VIDEO', 'AUDIO', 'STICKER', 'POLL'):
+            item = {'index': index, 'kind': kind.lower(),
+                    'identity': next((str(value(a, key)) for key in ('photo_id', 'video_id', 'file_id', 'sticker_id', 'poll_id') if value(a, key) is not None), None)}
+            if kind == 'POLL' and poll_seen:
+                text += ('\n[Дополнительный опрос MAX: ' + str(value(a, 'title', '')) +
+                    '. Голосование доступно в MAX.]')
+                continue
+            if kind == 'POLL':
+                poll_seen = True
+                item['poll'] = a.model_dump(mode='json') if hasattr(a, 'model_dump') else vars(a)
+            attachments.append(item)
         else:
-            parts.append({'text':f'[Вложение MAX: {kind or "неизвестный тип"}. Откройте его в MAX.]'})
-    if not parts:
+            text += f'\n[Вложение MAX: {kind or "неизвестный тип"}. Откройте его в MAX.]'
+    if unsupported:
+        text += '\n[Формат MAX без аналога Telegram: ' + ', '.join(unsupported) + ']'
+    if not text and not attachments:
         return []
-    link=getattr(message,'link',None)
-    reply=None
-    if link and str(getattr(getattr(link,'type',None),'value',getattr(link,'type',''))).upper()=='REPLY':
-        original=getattr(link,'message',None)
-        # Never map a forward/reference from a different MAX conversation.
-        if getattr(link,'chat_id',message.chat_id) in (None,message.chat_id):
-            reply=getattr(original,'id',None)
-    for p in parts:
-        p['reply_to']=reply
-    return parts
+    link = getattr(message, 'link', None)
+    reply = None
+    if link and str(getattr(value(link, 'type'), 'value', value(link, 'type', ''))).upper() == 'REPLY':
+        if value(link, 'chat_id', value(message, 'chat_id')) in (None, value(message, 'chat_id')):
+            reply = value(value(link, 'message'), 'id')
+    return [{'text': text, 'entities': entities, 'attachments': attachments, 'reply_to': reply}]
 
 
 class Bridge:
@@ -55,6 +68,9 @@ class Bridge:
         self.db,self.tg,self.hub,self.media,self.settings=db,tg,hub,media,settings
         self.ingest_locks={}
         self.stopped=False
+        self.delivery = Delivery(self)
+        self.interactions = Interactions(self)
+        self.delivery.interactions = self.interactions
         hub.on_event,hub.on_history=self.from_max,self.recover_history
 
     async def from_max(self,entry,action,message):
@@ -63,37 +79,49 @@ class Bridge:
         if chat_id is None or entry.closing:
             return
         async with self.ingest_locks.setdefault(a['id'],asyncio.Lock()):
+            if action=='reaction':
+                return await self.interactions.schedule(entry, message.chat_id, message.message_id, 'reaction')
             if action=='delete':
                 d=await self.db.pool.fetchrow('SELECT * FROM dialogs WHERE account_id=$1 AND owner=$2 AND max_chat_id=$3',a['id'],a['owner'],chat_id)
                 if d:
                     for mid in message.message_ids:
                         await self.db.enqueue(d,'tg','delete',str(mid),'',[{}])
                 return
-            # Suppress ALL self messages in v0.1, including the bridge's echo.
-            if getattr(message,'sender',None) in (None,a['max_user_id']):
+            # Intentional product behavior: never mirror messages written by the owner in MAX.
+            # A channel can omit sender; locally registered CIDs suppress our anonymous echo.
+            if getattr(message, 'sender', None) == a['max_user_id'] or getattr(message, 'cid', None) in getattr(entry.client, '_maxost_sent_cids', set()):
                 return
             if millis(getattr(message,'time',0)) < a['since_ms']:
                 return
             chat=await entry.client.get_chat(chat_id)
-            if not is_dialog(chat):
+            if not supported_chat(chat):
                 return
             title=chat.title
-            if not title:
+            if not title and message.sender is not None:
                 user=await entry.client.get_user(message.sender)
                 # User.names is a list of structured Name objects in PyMax.
                 names=getattr(user,'names',[]) or []
                 name=names[0] if names else None
                 title=' '.join(filter(None,[getattr(name,'first_name',None),getattr(name,'last_name',None)]))
             title=title or f'MAX · {message.sender}'
-            d=await self.db.dialog(a,chat_id,message.sender,title)
+            d=await self.db.dialog(a,chat_id,message.sender if is_dialog(chat) else None,title)
+            await self.db.pool.execute('UPDATE dialogs SET chat_kind=$3 WHERE id=$1 AND owner=$2',d['id'],a['owner'],chat_kind(chat))
             parts=normalize_max(message)
+            if chat_kind(chat) == 'CHAT' and parts:
+                author = f'Участник {message.sender}' if message.sender is not None else 'Группа MAX'
+                if message.sender is not None:
+                    user = await entry.client.get_user(message.sender)
+                    names = getattr(user, 'names', []) or []
+                    if names:
+                        author = ' '.join(filter(None, [value(names[0], 'first_name'), value(names[0], 'last_name')])) or author
+                parts[0] = prepend(parts[0], author + '\n')
             if parts:
                 if action=='edit':
-                    await self.db.enqueue(d,'tg','edit',str(message.id),self.db.vault.digest(revision(parts)),[{'parts':parts}])
+                    await self.db.enqueue(d,'tg','edit',str(message.id),uuid.uuid4().hex,[{'parts':parts}])
                 else:
                     await self.db.enqueue(d,'tg','send',str(message.id),'',parts)
 
-    async def from_telegram(self,message,edited=False):
+    async def from_telegram(self,message,edited=False,event_id=0):
         owner=message['from']['id']
         thread=message.get('message_thread_id')
         d=await self.db.by_thread(owner,thread) if thread else None
@@ -105,8 +133,18 @@ class Bridge:
         if account['status'] in ('reauth','paused','authorizing'):
             raise Rejected('MAX требует повторного входа. Проверьте /status.')
         parts=from_telegram(message,self.settings.max_file_bytes)
+        group_id = message.get('media_group_id')
+        if edited and not group_id:
+            links = await self.db.links(d, 'tg', message['message_id'])
+            source_key = links[0].get('source_key', '') if links else ''
+            if source_key.startswith('album:'):
+                group_id = source_key.removeprefix('album:')
+        if group_id:
+            version = int(message.get('edit_date', message.get('date', 0))) * 10_000_000 + event_id % 10_000_000
+            await self.db.collect_album(d, str(group_id), message['message_id'], parts[0], version)
+            return
         if edited:
-            await self.db.enqueue(d,'max','edit',str(message['message_id']),str(message.get('edit_date',0))+':'+self.db.vault.digest(revision(parts)),[{'parts':parts}])
+            await self.db.enqueue(d,'max','edit',str(message['message_id']),str(event_id)+':'+str(message.get('edit_date',0))+':'+revision(parts),[{'parts':parts}])
         else:
             await self.db.enqueue(d,'max','send',str(message['message_id']),'',parts)
 
@@ -119,7 +157,7 @@ class Bridge:
         links=await self.db.links(d,'tg',mid)
         if not links or any(link['origin']!='tg' for link in links):
             raise Rejected('Удалять можно только собственные сообщения, отправленные этим мостом.')
-        await self.db.enqueue(d,'max','delete',str(mid),'',[{}])
+        await self.db.enqueue(d,'max','delete',links[0].get('source_key') or str(mid),'',[{}])
 
     async def topic(self,d):
         d=await self.db.pool.fetchrow('SELECT * FROM dialogs WHERE id=$1 AND owner=$2',d['id'],d['owner'])
@@ -166,14 +204,14 @@ class Bridge:
             return
         start=max(a['since_ms'],a['history_ms']-1000)
         end=int(time.time()*1000)
-        chats={c.id:c for c in (entry.client.chats or []) if is_dialog(c)}
+        chats={c.id:c for c in (entry.client.chats or []) if supported_chat(c)}
         marker=None
         # Bounded work per pass, but never advance the checkpoint on an incomplete pass.
         for _ in range(self.settings.history_pages):
             page=await entry.client.fetch_chats(marker=marker)
             if not page:
                 break
-            chats.update({c.id:c for c in page if is_dialog(c)})
+            chats.update({c.id:c for c in page if supported_chat(c)})
             oldest=min(millis(c.last_event_time) for c in page)
             if oldest<=start:
                 break
@@ -225,44 +263,17 @@ class Bridge:
                 async with entry.gate:
                     self.hub.get(d['account_id'],d['owner'])
                     p=self.db.payload(job)
-                    if job['action']!='send':
-                        await self.db.mark_sending(job)
-                        external=True
-                        await self.change(entry,d,job,p)
-                        await self.db.complete(job)
-                        continue
-                    source='max' if job['direction']=='tg' else 'tg'
-                    reply=None
-                    if p.get('reply_to'):
-                        links=await self.db.links(d,source,p['reply_to'])
-                        if links:
-                            reply=links[0]['tg_message_id' if source=='max' else 'max_message_id']
-                    if job['direction']=='tg':
-                        thread=await self.topic(d)
-                        upload=None
-                        kind='text'
-                        if p.get('attachment'):
-                            kind,name,raw=await self.media.for_telegram(entry.client,d['max_chat_id'],job['source_id'],p['attachment']['index'])
-                            upload=(kind,name,raw)
-                        await self.tg.pace(d['owner'])
-                        await self.db.mark_sending(job)
-                        external=True
-                        params={'chat_id':d['owner'],'message_thread_id':thread}
-                        if reply:
-                            params['reply_parameters']={'message_id':int(reply),'allow_sending_without_reply':True}
-                        if upload:
-                            field,name,raw=upload
-                            method={'photo':'sendPhoto','document':'sendDocument','video':'sendVideo','voice':'sendVoice'}[field]
-                            result=await self.tg.call(method,params,files={field:(name,raw)})
-                        else:
-                            result=await self.tg.call('sendMessage',{**params,'text':p['text'],'link_preview_options':{'is_disabled':True}})
-                        await self.db.complete(job,result['message_id'],job['source_id'],kind)
+                    if job['direction'] == 'max' and job['action'] in ('send','edit'):
+                        chat = await entry.client.get_chat(d['max_chat_id'])
+                        if not can_publish(chat, entry.account['max_user_id']):
+                            raise Rejected('Канал доступен только для чтения: у вашего MAX-аккаунта нет прав публикации.')
+                    await self.db.mark_sending(job)
+                    external = True
+                    if job['action'] == 'send':
+                        await self.delivery.send(entry, d, job, p)
                     else:
-                        attachments=[await self.media.for_max(p['attachment'])] if p.get('attachment') else None
-                        await self.db.mark_sending(job)
-                        external=True
-                        result=await mutate(entry.client,'send_message',chat_id=d['max_chat_id'],text=p['text'] or None,reply_to=int(reply) if reply else None,attachments=attachments)
-                        await self.db.complete(job,job['source_id'],result.id,p.get('attachment',{}).get('kind','text'))
+                        await self.delivery.change(entry, d, job, p)
+                    await self.db.complete(job)
             except asyncio.CancelledError:
                 # recover() classifies sending as unknown on the next start.
                 raise
@@ -281,49 +292,29 @@ class Bridge:
                     await self.db.state(job,'failed','Тема закрыта. Откройте её и повторите задание.')
                 else:
                     await self.db.state(job,'failed',str(exc))
+            except SessionRevoked as exc:
+                await self.hub.reauth(entry)
+                await self.db.state(job,'failed',str(exc))
             except Rejected as exc:
                 await self.db.state(job,'failed',str(exc))
             except Exception as exc:
+                if is_revoked(exc):
+                    await self.hub.reauth(entry)
+                    await self.db.state(job, 'failed', str(SessionRevoked()))
+                    continue
                 log.warning('Delivery failed (%s), job=%s',type(exc).__name__,job['id'])
                 await self.db.state(job,'unknown' if external else 'failed','Не удалось подтвердить результат.' if external else 'Ошибка подготовки сообщения. Используйте /retry после проверки /status.')
 
     async def change(self,entry,d,job,p):
-        source='max' if job['direction']=='tg' else 'tg'
-        links=await self.db.links(d,source,job['source_id'])
-        if not links:
-            # An edit/delete for a pre-bridge message must not create a new message.
-            return
-        if job['action']=='delete':
-            if source=='max':
-                for link in links:
-                    try:
-                        await self.tg.call('deleteMessage',{'chat_id':d['owner'],'message_id':link['tg_message_id']})
-                    except TelegramRejected as exc:
-                        if 'message to delete not found' not in exc.description.lower():
-                            raise
-            else:
-                if any(link['origin']!='tg' for link in links):
-                    raise Rejected('Нельзя удалить чужое сообщение.')
-                await mutate(entry.client,'delete_message',chat_id=d['max_chat_id'],message_ids=list({int(x['max_message_id']) for x in links}),for_me=False)
-            return
-        parts=p['parts']
-        text_links=[x for x in links if x['kind']=='text']
-        text_parts=[x for x in parts if not x.get('attachment')]
-        if len(text_parts)!=len(text_links) or any(x.get('attachment') for x in parts):
-            raise Rejected('Редактирование вложений или изменение числа частей текста пока не поддерживается. Отправьте новое сообщение.')
-        for link,part in zip(text_links,text_parts):
-            if source=='max':
-                try:
-                    await self.tg.call('editMessageText',{'chat_id':d['owner'],'message_id':link['tg_message_id'],'text':part['text'],'link_preview_options':{'is_disabled':True}})
-                except TelegramRejected as exc:
-                    if 'message is not modified' not in exc.description.lower():
-                        raise
-            else:
-                if link['origin']!='tg':
-                    raise Rejected('Нельзя редактировать чужое сообщение.')
-                await mutate(entry.client,'edit_message',chat_id=d['max_chat_id'],message_id=int(link['max_message_id']),text=part['text'])
+        return await self.delivery.change(entry,d,job,p)
 
     async def notify_errors(self):
+        for a in await self.db.pool.fetch("SELECT id,owner FROM accounts WHERE status='reauth' AND NOT reauth_notified"):
+            try:
+                await self.tg.text(a['owner'], 'Подключение MAX остановлено: сессия отозвана или больше не действует.\nДля повторного входа: /disconnect, затем /connect.\nАвтоматически запрашивать SMS бот не будет.')
+            except Exception:
+                continue
+            await self.db.pool.execute("UPDATE accounts SET reauth_notified=true WHERE id=$1 AND owner=$2 AND status='reauth'", a['id'], a['owner'])
         rows=await self.db.pool.fetch("""SELECT j.*,d.tg_thread_id FROM jobs j JOIN dialogs d ON d.id=j.dialog_id
             WHERE j.status IN ('failed','unknown','skipped') AND j.error IS NOT NULL AND NOT j.notified
             ORDER BY j.id LIMIT 20""")

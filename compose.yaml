@@ -13,10 +13,10 @@ services:
       interval: 5s
       timeout: 3s
       retries: 20
-    # Intentionally no host port: PostgreSQL is internal to this Compose network.
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+
   bot:
     build: .
     restart: unless-stopped
@@ -34,7 +34,6 @@ services:
       HISTORY_MAX_PAGES: ${HISTORY_MAX_PAGES:-20}
       HISTORY_INTERVAL_SECONDS: ${HISTORY_INTERVAL_SECONDS:-120}
       RETENTION_DAYS: ${RETENTION_DAYS:-30}
-      RICH_UI: ${RICH_UI:-true}
       ALLOWED_TELEGRAM_IDS: ${ALLOWED_TELEGRAM_IDS:-}
     read_only: true
     tmpfs:
@@ -47,5 +46,6 @@ services:
     logging:
       driver: json-file
       options: {max-size: "10m", max-file: "3"}
+
 volumes:
   postgres_data:
