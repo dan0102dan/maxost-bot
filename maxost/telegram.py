@@ -17,13 +17,18 @@ class TelegramRejected(Rejected):
 
 
 READ_METHODS = {'getMe','getUpdates','getFile','getChat','getWebhookInfo'}
-IDEMPOTENT = READ_METHODS | {'editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','setMessageReaction','deleteMessage','answerCallbackQuery','reopenForumTopic','setMyCommands'}
+IDEMPOTENT = READ_METHODS | {
+    'editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup',
+    'setMessageReaction','deleteMessage','answerCallbackQuery','reopenForumTopic','setMyCommands'
+}
 
 
 class Telegram:
     def __init__(self, token, base='https://api.telegram.org', client=None):
         self.base, self.token = base.rstrip('/'), token
-        self.http = client or httpx.AsyncClient(timeout=httpx.Timeout(65, connect=15), follow_redirects=False)
+        self.http = client or httpx.AsyncClient(
+            timeout=httpx.Timeout(65, connect=15), follow_redirects=False
+        )
         self.send_locks = defaultdict(asyncio.Lock)
         self.last_send = {}
 
@@ -34,10 +39,17 @@ class Telegram:
         params = {k:v for k,v in (params or {}).items() if v is not None}
         try:
             if files:
-                data = {k: json.dumps(v,ensure_ascii=False) if not isinstance(v,str) else v for k,v in params.items()}
-                response = await self.http.post(f'{self.base}/bot{self.token}/{method}', data=data, files=files)
+                data = {
+                    k: json.dumps(v,ensure_ascii=False) if not isinstance(v,str) else v
+                    for k,v in params.items()
+                }
+                response = await self.http.post(
+                    f'{self.base}/bot{self.token}/{method}', data=data, files=files
+                )
             else:
-                response = await self.http.post(f'{self.base}/bot{self.token}/{method}', json=params)
+                response = await self.http.post(
+                    f'{self.base}/bot{self.token}/{method}', json=params
+                )
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             raise RetryLater("Telegram временно недоступен", 5) from None
         except httpx.HTTPError:
@@ -54,11 +66,16 @@ class Telegram:
             return body['result']
         code = body.get('error_code', response.status_code)
         if code == 429:
-            raise RetryLater("Telegram ограничил частоту запросов", body.get('parameters',{}).get('retry_after',5))
+            raise RetryLater(
+                "Telegram ограничил частоту запросов",
+                body.get('parameters',{}).get('retry_after',5),
+            )
         if code >= 500:
             if method in IDEMPOTENT:
                 raise RetryLater("Временная ошибка Telegram", 10)
-            raise Uncertain("Telegram вернул серверную ошибку; результат отправки неизвестен.")
+            raise Uncertain(
+                "Telegram вернул серверную ошибку; результат отправки неизвестен."
+            )
         raise TelegramRejected(code, body.get('description',''))
 
     async def pace(self, chat):
@@ -77,10 +94,27 @@ class Telegram:
     async def text(self, owner, text, thread=None, reply=None):
         await self.pace(owner)
         return await self.call('sendMessage', {
-            'chat_id':owner, 'message_thread_id':thread, 'text':text,
-            'reply_parameters':{'message_id':reply,'allow_sending_without_reply':True} if reply else None,
+            'chat_id':owner,
+            'message_thread_id':thread,
+            'text':text,
+            'reply_parameters':{
+                'message_id':reply,'allow_sending_without_reply':True
+            } if reply else None,
             'link_preview_options':{'is_disabled':True},
         })
+
+    async def photo(self, owner, data: bytes, caption='', reply_markup=None):
+        await self.pace(owner)
+        return await self.call(
+            'sendPhoto',
+            {
+                'chat_id': owner,
+                'caption': caption,
+                'protect_content': True,
+                'reply_markup': reply_markup,
+            },
+            files={'photo': ('max-login.png', data, 'image/png')},
+        )
 
     async def remove(self, owner, message_id):
         try:
@@ -97,7 +131,9 @@ class Telegram:
         if info.get('file_size',0) > limit:
             raise Rejected("Вложение превышает лимит размера.")
         try:
-            async with self.http.stream('GET', f'{self.base}/file/bot{self.token}/{path}') as r:
+            async with self.http.stream(
+                'GET', f'{self.base}/file/bot{self.token}/{path}'
+            ) as r:
                 r.raise_for_status()
                 chunks, length = [], 0
                 async for chunk in r.aiter_bytes():
