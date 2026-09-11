@@ -205,6 +205,8 @@ class Database(ContentStore):
         await self.flush_albums()
         # Lock the dialog before choosing a job. A retry can requeue an older ID;
         # its claim must never overlap a newer in-flight job in the same direction.
+        # Inbound jobs may bypass only independent sources. Keep all operations
+        # for one source ordered even if its send has no links or only partial links.
         async with self.pool.acquire() as connection, connection.transaction():
             dialog = await connection.fetchrow(
                 '''SELECT d.id FROM dialogs d JOIN accounts a ON a.id=d.account_id
@@ -216,10 +218,11 @@ class Database(ContentStore):
                         SELECT 1 FROM jobs active WHERE active.dialog_id=j.dialog_id
                         AND active.direction=j.direction
                         AND active.status IN ('claimed','sending'))
-                    AND (j.direction='tg' OR NOT EXISTS (
+                    AND NOT EXISTS (
                         SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
-                        AND prev.direction=j.direction AND prev.id<j.id
-                        AND prev.status NOT IN ('sent','skipped')))
+                        AND prev.owner=j.owner AND prev.direction=j.direction
+                        AND prev.id<j.id AND prev.status NOT IN ('sent','skipped')
+                        AND (j.direction='max' OR prev.source_id=j.source_id))
                     ORDER BY j.id LIMIT 1
                 ) ready ON true
                 WHERE a.status IN ('connected','offline')
@@ -227,7 +230,8 @@ class Database(ContentStore):
             )
             if dialog is None:
                 return None
-            # READ COMMITTED gets a fresh snapshot after taking the dialog lock.
+            # Recheck the same dependency predicate against a fresh snapshot
+            # after taking the dialog lock (also held by manual retry/skip).
             return await connection.fetchrow(
                 '''WITH next AS (
                     SELECT j.id FROM jobs j
@@ -236,10 +240,11 @@ class Database(ContentStore):
                         SELECT 1 FROM jobs active WHERE active.dialog_id=j.dialog_id
                         AND active.direction=j.direction
                         AND active.status IN ('claimed','sending'))
-                    AND (j.direction='tg' OR NOT EXISTS (
+                    AND NOT EXISTS (
                         SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
-                        AND prev.direction=j.direction AND prev.id<j.id
-                        AND prev.status NOT IN ('sent','skipped')))
+                        AND prev.owner=j.owner AND prev.direction=j.direction
+                        AND prev.id<j.id AND prev.status NOT IN ('sent','skipped')
+                        AND (j.direction='max' OR prev.source_id=j.source_id))
                     ORDER BY j.id FOR UPDATE SKIP LOCKED LIMIT 1
                 ) UPDATE jobs SET status='claimed',updated_at=now()
                 FROM next WHERE jobs.id=next.id RETURNING jobs.*''', dialog['id'],
