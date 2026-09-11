@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: maxost
+      POSTGRES_USER: maxost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run python3 scripts/configure.py}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maxost -d maxost"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # Intentionally no host port: PostgreSQL is internal to this Compose network.
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  bot:
+    build: .
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres: {condition: service_healthy}
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Run python3 scripts/configure.py}
+      ENCRYPTION_KEYS: ${ENCRYPTION_KEYS:?Run python3 scripts/configure.py}
+      DATABASE_URL: postgresql://maxost:${POSTGRES_PASSWORD}@postgres:5432/maxost
+      MAX_ACCOUNTS: ${MAX_ACCOUNTS:-100}
+      WORKERS: ${WORKERS:-4}
+      AUTH_TTL_SECONDS: ${AUTH_TTL_SECONDS:-600}
+      MAX_FILE_MB: ${MAX_FILE_MB:-20}
+      HISTORY_MAX_PAGES: ${HISTORY_MAX_PAGES:-20}
+      HISTORY_INTERVAL_SECONDS: ${HISTORY_INTERVAL_SECONDS:-120}
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      RICH_UI: ${RICH_UI:-true}
+      ALLOWED_TELEGRAM_IDS: ${ALLOWED_TELEGRAM_IDS:-}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    stop_grace_period: 45s
+    mem_limit: 1g
+    pids_limit: 128
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+volumes:
+  postgres_data:

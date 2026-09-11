@@ -1,0 +1,181 @@
+from __future__ import annotations
+
+import time
+import uuid
+from pathlib import Path
+
+from .errors import Rejected
+
+
+class Database:
+    def __init__(self, pool, vault):
+        self.pool, self.vault = pool, vault
+
+    @classmethod
+    async def connect(cls, dsn, vault, workers=4):
+        import asyncpg
+        pool = await asyncpg.create_pool(dsn, min_size=2, max_size=workers + 8, command_timeout=30)
+        return cls(pool, vault)
+
+    async def migrate(self):
+        async with self.pool.acquire() as c, c.transaction():
+            await c.execute("SELECT pg_advisory_xact_lock(673903100)")
+            await c.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY)")
+            for file in sorted(Path(__file__).with_name("migrations").glob("*.sql")):
+                if not await c.fetchval("SELECT 1 FROM schema_migrations WHERE version=$1", file.name):
+                    await c.execute(file.read_text())
+                    await c.execute("INSERT INTO schema_migrations VALUES($1)", file.name)
+
+    async def consent(self, owner):
+        await self.pool.execute("INSERT INTO users(id) VALUES($1) ON CONFLICT DO NOTHING", owner)
+
+    async def account(self, owner):
+        return await self.pool.fetchrow("SELECT * FROM accounts WHERE owner=$1", owner)
+
+    async def new_account(self, owner, phone, capacity):
+        aid = uuid.uuid4()
+        fingerprint = self.vault.digest("phone:" + phone)
+        now = int(time.time() * 1000)
+        async with self.pool.acquire() as c, c.transaction():
+            # Global short transaction: capacity and shared-phone SMS limits must be race-free.
+            await c.execute("SELECT pg_advisory_xact_lock(673903101)")
+            if await c.fetchval("SELECT 1 FROM accounts WHERE owner=$1 OR phone_hash=$2", owner, fingerprint):
+                raise Rejected("Подключение уже существует. Используйте /status или /disconnect.")
+            if await c.fetchval("SELECT count(*) FROM accounts") >= capacity:
+                raise Rejected("Сервис временно не принимает новые подключения.")
+            counts = await c.fetchrow("""
+                SELECT count(*) FILTER(WHERE owner=$1) AS per_user,
+                       count(*) FILTER(WHERE phone_hash=$2) AS per_phone,
+                       count(*) AS total,
+                       count(*) FILTER(WHERE (owner=$1 OR phone_hash=$2)
+                           AND created_at>now()-interval '60 seconds') AS recent
+                FROM auth_attempts WHERE created_at>now()-interval '1 hour'
+            """, owner, fingerprint)
+            if counts['per_user'] >= 3 or counts['per_phone'] >= 3 or counts['total'] >= 60 or counts['recent']:
+                raise Rejected("Слишком много попыток входа. Повторите позже (лимит: 3 в час).")
+            await c.execute("INSERT INTO auth_attempts(owner,phone_hash) VALUES($1,$2)", owner, fingerprint)
+            return await c.fetchrow("""
+                INSERT INTO accounts(id,owner,phone_hash,phone_cipher,since_ms,history_ms)
+                VALUES($1,$2,$3,$4,$5,$5) RETURNING *
+            """, aid, owner, fingerprint, self.vault.seal(owner, f"phone:{aid}", phone), now)
+
+    async def activate(self, aid, owner, max_id):
+        try:
+            result = await self.pool.execute("""UPDATE accounts SET max_user_id=$3,status='connected'
+                WHERE id=$1 AND owner=$2""", aid, owner, max_id)
+        except Exception as e:
+            if getattr(e, 'sqlstate', None) == '23505':
+                raise Rejected("Этот аккаунт MAX уже подключён к другому пользователю.") from None
+            raise
+        if result != "UPDATE 1":
+            raise Rejected("Подключение отменено.")
+
+    async def dialog(self, account, max_chat_id, peer_id, title):
+        did = uuid.uuid4()
+        # Encrypt with account/chat context, so an ON CONFLICT update retains a valid envelope.
+        purpose = f"title:{account['id']}:{max_chat_id}"
+        return await self.pool.fetchrow("""
+            INSERT INTO dialogs(id,account_id,owner,max_chat_id,peer_id,title_cipher)
+            VALUES($1,$2,$3,$4,$5,$6)
+            ON CONFLICT(account_id,max_chat_id) DO UPDATE SET
+                title_cipher=excluded.title_cipher,peer_id=excluded.peer_id
+            RETURNING *
+        """, did, account['id'], account['owner'], max_chat_id, peer_id,
+            self.vault.seal(account['owner'], purpose, title))
+
+    async def by_thread(self, owner, thread):
+        return await self.pool.fetchrow("SELECT * FROM dialogs WHERE owner=$1 AND tg_thread_id=$2", owner, thread)
+
+    async def enqueue(self, dialog, direction, action, source_id, revision, parts):
+        async with self.pool.acquire() as c, c.transaction():
+            # Serializes queue insertion order for the same dialog.
+            await c.fetchval("SELECT id FROM dialogs WHERE id=$1 AND owner=$2 FOR UPDATE", dialog['id'], dialog['owner'])
+            for n, payload in enumerate(parts):
+                purpose = f"job:{dialog['id']}:{direction}:{action}:{source_id}:{revision}:{n}"
+                await c.execute("""
+                    INSERT INTO jobs(owner,dialog_id,direction,action,source_id,revision,part,payload)
+                    VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING
+                """, dialog['owner'], dialog['id'], direction, action, str(source_id), revision, n,
+                    self.vault.seal(dialog['owner'], purpose, payload))
+
+    def payload(self, job):
+        purpose = f"job:{job['dialog_id']}:{job['direction']}:{job['action']}:{job['source_id']}:{job['revision']}:{job['part']}"
+        return self.vault.open(job['owner'], purpose, bytes(job['payload']))
+
+    async def recover(self):
+        # The application holds a singleton advisory lock before calling this.
+        await self.pool.execute("UPDATE jobs SET status='pending' WHERE status='claimed'")
+        await self.pool.execute("""UPDATE jobs SET status='unknown',notified=false,
+            error='Процесс остановился во время отправки; результат неизвестен.' WHERE status='sending'""")
+        await self.pool.execute("UPDATE dialogs SET topic_state='unknown' WHERE topic_state='creating'")
+        await self.pool.execute("UPDATE accounts SET status='offline' WHERE status='connected'")
+        await self.pool.execute("DELETE FROM accounts WHERE status='authorizing' AND session_cipher IS NULL")
+        await self.pool.execute("UPDATE accounts SET status='reauth' WHERE status='authorizing'")
+
+    async def claim(self):
+        return await self.pool.fetchrow("""
+            WITH next AS (
+                SELECT j.id FROM jobs j
+                JOIN dialogs d ON d.id=j.dialog_id JOIN accounts a ON a.id=d.account_id
+                WHERE j.status='pending' AND j.available_at<=now()
+                  AND a.status IN ('connected','offline')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
+                    AND prev.direction=j.direction AND prev.id<j.id
+                    AND prev.status NOT IN ('sent','skipped'))
+                ORDER BY j.id FOR UPDATE OF j SKIP LOCKED LIMIT 1
+            ) UPDATE jobs SET status='claimed',updated_at=now()
+              FROM next WHERE jobs.id=next.id RETURNING jobs.*
+        """)
+
+    async def state(self, job, status, error=None, delay=0):
+        await self.pool.execute("""UPDATE jobs SET status=$3,error=$4,updated_at=now(),
+            available_at=now()+($5::double precision*interval '1 second'),notified=false
+            WHERE id=$1 AND owner=$2""", job['id'], job['owner'], status, error, delay)
+
+    async def mark_sending(self, job):
+        await self.pool.execute("UPDATE jobs SET status='sending',attempts=attempts+1,updated_at=now() WHERE id=$1 AND owner=$2", job['id'], job['owner'])
+
+    async def complete(self, job, tg_id=None, max_id=None, kind='text'):
+        async with self.pool.acquire() as c, c.transaction():
+            if tg_id is not None and max_id is not None and job['action'] == 'send':
+                await c.execute("""INSERT INTO message_links(job_id,owner,dialog_id,tg_message_id,
+                    max_message_id,kind,origin,part) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+                    ON CONFLICT(job_id) DO NOTHING""", job['id'], job['owner'], job['dialog_id'],
+                    int(tg_id), str(max_id), kind, 'max' if job['direction']=='tg' else 'tg', job['part'])
+            await c.execute("UPDATE jobs SET status='sent',payload=NULL,error=NULL,updated_at=now() WHERE id=$1 AND owner=$2", job['id'], job['owner'])
+
+    async def links(self, dialog, source, message_id):
+        column = {'tg': 'tg_message_id', 'max': 'max_message_id'}[source]
+        value = int(message_id) if source=='tg' else str(message_id)
+        return await self.pool.fetch(f"SELECT * FROM message_links WHERE owner=$1 AND dialog_id=$2 AND {column}=$3 ORDER BY part,job_id", dialog['owner'], dialog['id'], value)
+
+    async def queue_control(self, owner, job_id, action, confirm=False):
+        async with self.pool.acquire() as c, c.transaction():
+            job = await c.fetchrow("SELECT * FROM jobs WHERE owner=$1 AND id=$2 FOR UPDATE", owner, job_id)
+            if not job or job['status'] not in ('failed','unknown'):
+                raise Rejected("Задание не найдено или уже обрабатывается.")
+            if action == 'retry' and job['payload'] is None:
+                raise Rejected('Срок хранения содержимого истёк. Отправьте сообщение заново.')
+            if action == 'retry' and job['status']=='unknown' and not confirm:
+                raise Rejected(f"Возможен дубль. Проверьте переписку, затем /retry {job_id} confirm или /skip {job_id}.")
+            state = 'pending' if action=='retry' else 'skipped'
+            await c.execute("""UPDATE jobs SET status=$3,error=NULL,notified=false,
+                available_at=now(),updated_at=now(),payload=CASE WHEN $3='skipped' THEN NULL ELSE payload END
+                WHERE id=$1 AND owner=$2""", job_id, owner, state)
+
+    async def set_offset(self, value):
+        await self.pool.execute("INSERT INTO bot_state VALUES('offset',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", value)
+
+    async def get_offset(self):
+        return await self.pool.fetchval("SELECT value FROM bot_state WHERE key='offset'") or 0
+
+    async def cleanup(self, retention):
+        await self.pool.execute("DELETE FROM auth_attempts WHERE created_at<now()-interval '1 day'")
+        await self.pool.execute("""DELETE FROM jobs WHERE status IN ('sent','skipped')
+            AND updated_at<now()-($1::integer*interval '1 day')""", retention)
+        # Undelivered content has a maximum lifetime too; never silently discard it.
+        await self.pool.execute("""UPDATE jobs SET status='skipped',payload=NULL,
+            error='Истёк срок хранения недоставленного сообщения',notified=false,updated_at=now()
+            WHERE status IN ('pending','failed','unknown')
+            AND created_at<now()-($1::integer*interval '1 day')""", retention)

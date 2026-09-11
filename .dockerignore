@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+secrets
+backups
+__pycache__
+**/__pycache__
+.pytest_cache
+.venv
+.ruff_cache
+.coverage
+*.zip
+*.db
+*.sqlite*
