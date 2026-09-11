@@ -20,24 +20,7 @@ from .media import Media
 from .telegram import Telegram
 
 log=logging.getLogger(__name__)
-HELP='''MAXOST · MAX ↔ Telegram
-
-/connect — подключить свой аккаунт MAX
-/status — соединение и очередь доставки
-/disconnect — отозвать подключение и удалить данные
-/cancel — отменить ввод номера или кода
-/delete — ответьте на своё сообщение, чтобы удалить его в MAX
-/retry N — повторить задание с известной ошибкой
-/retry N confirm — повторить после НЕИЗВЕСТНОГО результата (возможен дубль)
-/skip N — пропустить задание и разблокировать очередь
-/bind UUID — восстановить привязку, находясь в нужной теме
-/help — эта справка
-
-Один собеседник MAX = одна тема. Без привязанной темы сообщения никуда не отправляются.
-Поддерживаются текст, фото, файлы, видео и голосовые до 20 МБ; альбомы идут отдельными сообщениями. Форматирование переносится не полностью.
-В MAX сообщения отправляются от вашего личного аккаунта. Написанное вами непосредственно в приложении MAX в этой версии не зеркалируется.
-Обычное удаление сообщения в Telegram не удаляет его в MAX: используйте /delete.
-Ничего не вводите, пока бот не попросил номер, код или 2FA-пароль. Мы не сотрудники MAX или Telegram.'''
+HELP='MAXOST · MAX ↔ Telegram\n\n/connect — подключить MAX\n/status — соединение и очередь\n/disconnect — отключить аккаунт и удалить данные\n/cancel — отменить вход\n/react — реакции (ответом на сообщение)\n/poll — результаты опроса (ответом на сообщение)\n/delete — удалить своё сообщение в MAX (ответом)\n/retry N — повторить ошибку; /retry N confirm — подтвердить риск дубля\n/skip N — пропустить задание\n/bind UUID — восстановить привязку в теме\n\nДиалог, группа или канал MAX = отдельная тема. В каналах публикация доступна только с правами MAX.\nПоддерживаются медиа, альбомы, стикеры, опросы и форматирование. Голосуйте кнопками карточки: голоса отправляются в исходный опрос MAX.\nНаписанное вами в MAX намеренно не дублируется. История до первого подключения не импортируется. Typing/read receipts не передаются.\n/help — эта справка. Мы не сотрудники MAX или Telegram.'
 
 
 class Application:
@@ -98,6 +81,8 @@ class Application:
                 raise Rejected('Формат: /bind UUID — внутри нужной темы.')
             await self.bridge.bind(owner,args[1],thread)
             await self.tg.text(owner,'Тема привязана. Теперь повторите остановленное задание командой /retry N.',thread)
+        elif command in ('/react', '/poll'):
+            await self.bridge.interactions.command(owner, message or {}, 'reaction' if command == '/react' else 'poll_refresh')
         elif command=='/delete':
             if not message:
                 raise Rejected('Отправьте /delete ответом на сообщение.')
@@ -118,10 +103,21 @@ class Application:
                 data=q.get('data','')
                 if data in ('nav:connect','nav:status','nav:help'):
                     await self.command(owner,'/'+data.split(':')[1])
+                elif data.startswith('c:'):
+                    await self.bridge.interactions.callback(q)
                 else:
                     await self.auth.callback(q)
             except BridgeError as exc:
                 await self.tg.text(owner,str(exc))
+            return
+        if 'message_reaction' in update:
+            reaction = {**update['message_reaction'], 'update_id': update['update_id']}
+            owner = reaction.get('user', {}).get('id')
+            if self.allowed(owner):
+                try:
+                    await self.bridge.interactions.native_reaction(reaction)
+                except Rejected as exc:
+                    await self.tg.text(owner, str(exc))
             return
         if 'my_chat_member' in update:
             change=update['my_chat_member']
@@ -149,7 +145,7 @@ class Application:
                 # Number and SMS text are never accepted through ordinary messages.
                 await self.tg.remove(owner,message['message_id'])
                 raise Rejected('Используйте кнопки на экране входа. Для отмены — /cancel.')
-            await self.bridge.from_telegram(message,edited='edited_message' in update)
+            await self.bridge.from_telegram(message,edited='edited_message' in update,event_id=update.get('update_id', 0))
         except Rejected as exc:
             await self.tg.text(owner,str(exc),message.get('message_thread_id'))
 
@@ -159,7 +155,7 @@ class Application:
             try:
                 updates=await self.tg.call('getUpdates',{
                     'offset':offset,'timeout':30,'limit':50,
-                    'allowed_updates':['message','edited_message','callback_query','my_chat_member']})
+                    'allowed_updates':['message','edited_message','callback_query','my_chat_member','message_reaction']})
                 for update in updates:
                     try:
                         await self.handle(update)
@@ -208,7 +204,7 @@ async def serve():
         await db.migrate()
         lock_connection=await db.pool.acquire()
         if not await lock_connection.fetchval('SELECT pg_try_advisory_lock(673903102)'):
-            raise RuntimeError('Only one MAXOST application instance is supported in v0.1')
+            raise RuntimeError('Only one MAXOST application instance is supported')
         me=await tg.call('getMe')
         if not me.get('has_topics_enabled'):
             raise RuntimeError('Enable private-chat forum topics in BotFather before starting MAXOST')
@@ -221,6 +217,8 @@ async def serve():
             {'command':'disconnect','description':'Отключить MAX и удалить данные'},
             {'command':'cancel','description':'Отменить ввод'},
             {'command':'help','description':'Справка'},
+            {'command':'react','description':'Реакции MAX (ответом на сообщение)'},
+            {'command':'poll','description':'Результаты опроса MAX (ответом)'},
         ]})
         await db.recover()
         await app.hub.restore()

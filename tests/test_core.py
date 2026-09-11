@@ -115,12 +115,11 @@ def test_scope_check_and_dialog_type():
 def test_caption_attachment_and_reply_are_not_lost():
     parts=from_telegram({'caption':'long caption','document':{'file_id':'id','file_name':'../../private.txt','file_size':10},'reply_to_message':{'message_id':8}},1024)
     assert parts[0]['text']=='long caption'
-    assert parts[1]['attachment']['name']=='private.txt'
+    assert parts[0]['attachments'][0]['name']=='private.txt'
     assert all(p['reply_to']==8 for p in parts)
     with pytest.raises(Rejected):
         from_telegram({'document':{'file_id':'id','file_size':2048}},1024)
-    with pytest.raises(Rejected):
-        from_telegram({'sticker':{'file_id':'id'}},1024)
+    assert from_telegram({'sticker':{'file_id':'id'}},1024)[0]['attachments'][0]['kind']=='sticker'
     assert safe_name('C:\\temp\\test.txt')=='test.txt'
 
 
@@ -129,8 +128,8 @@ def test_max_normalization_does_not_copy_self_destruct_content():
     msg=NS(ttl=False,text='Hello',attaches=[NS(type='PHOTO'),NS(type='STICKER')],link=None)
     parts=normalize_max(msg)
     assert parts[0]['text']=='Hello'
-    assert parts[1]['attachment']['index']==0
-    assert 'STICKER' in parts[2]['text']
+    assert parts[0]['attachments'][0]['index']==0
+    assert parts[0]['attachments'][1]['kind']=='sticker'
     assert millis(1700000000)==1700000000000
     assert millis(1700000000000)==1700000000000
 

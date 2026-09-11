@@ -5,9 +5,10 @@ import uuid
 from pathlib import Path
 
 from .errors import Rejected
+from .content_store import ContentStore
 
 
-class Database:
+class Database(ContentStore):
     def __init__(self, pool, vault):
         self.pool, self.vault = pool, vault
 
@@ -61,7 +62,7 @@ class Database:
 
     async def activate(self, aid, owner, max_id):
         try:
-            result = await self.pool.execute("""UPDATE accounts SET max_user_id=$3,status='connected'
+            result = await self.pool.execute("""UPDATE accounts SET max_user_id=$3,status='connected',reauth_notified=false
                 WHERE id=$1 AND owner=$2""", aid, owner, max_id)
         except Exception as e:
             if getattr(e, 'sqlstate', None) == '23505':
@@ -113,6 +114,7 @@ class Database:
         await self.pool.execute("UPDATE accounts SET status='reauth' WHERE status='authorizing'")
 
     async def claim(self):
+        await self.flush_albums()
         return await self.pool.fetchrow("""
             WITH next AS (
                 SELECT j.id FROM jobs j
@@ -137,18 +139,14 @@ class Database:
         await self.pool.execute("UPDATE jobs SET status='sending',attempts=attempts+1,updated_at=now() WHERE id=$1 AND owner=$2", job['id'], job['owner'])
 
     async def complete(self, job, tg_id=None, max_id=None, kind='text'):
-        async with self.pool.acquire() as c, c.transaction():
-            if tg_id is not None and max_id is not None and job['action'] == 'send':
-                await c.execute("""INSERT INTO message_links(job_id,owner,dialog_id,tg_message_id,
-                    max_message_id,kind,origin,part) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
-                    ON CONFLICT(job_id) DO NOTHING""", job['id'], job['owner'], job['dialog_id'],
-                    int(tg_id), str(max_id), kind, 'max' if job['direction']=='tg' else 'tg', job['part'])
-            await c.execute("UPDATE jobs SET status='sent',payload=NULL,error=NULL,updated_at=now() WHERE id=$1 AND owner=$2", job['id'], job['owner'])
+        if tg_id is not None and max_id is not None and job['action'] == 'send':
+            await self.save_links(job, [{'tg': tg_id, 'max': max_id, 'kind': kind, 'part': 0}])
+        await self.pool.execute("UPDATE jobs SET status='sent',payload=NULL,error=NULL,updated_at=now() WHERE id=$1 AND owner=$2", job['id'], job['owner'])
 
     async def links(self, dialog, source, message_id):
         column = {'tg': 'tg_message_id', 'max': 'max_message_id'}[source]
         value = int(message_id) if source=='tg' else str(message_id)
-        return await self.pool.fetch(f"SELECT * FROM message_links WHERE owner=$1 AND dialog_id=$2 AND {column}=$3 ORDER BY part,job_id", dialog['owner'], dialog['id'], value)
+        return await self.pool.fetch(f"SELECT * FROM message_links WHERE owner=$1 AND dialog_id=$2 AND {column}=$3 ORDER BY part,id", dialog['owner'], dialog['id'], value)
 
     async def queue_control(self, owner, job_id, action, confirm=False):
         async with self.pool.acquire() as c, c.transaction():
@@ -171,6 +169,8 @@ class Database:
         return await self.pool.fetchval("SELECT value FROM bot_state WHERE key='offset'") or 0
 
     async def cleanup(self, retention):
+        for table in ('albums', 'content_cards'):
+            await self.pool.execute(f"DELETE FROM {table} WHERE updated_at<now()-($1::integer*interval '1 day')", retention)
         await self.pool.execute("DELETE FROM auth_attempts WHERE created_at<now()-interval '1 day'")
         await self.pool.execute("""DELETE FROM jobs WHERE status IN ('sent','skipped')
             AND updated_at<now()-($1::integer*interval '1 day')""", retention)

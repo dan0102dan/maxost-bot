@@ -17,7 +17,7 @@ class TelegramRejected(Rejected):
 
 
 READ_METHODS = {'getMe','getUpdates','getFile','getChat','getWebhookInfo'}
-IDEMPOTENT = READ_METHODS | {'editMessageText','editMessageCaption','deleteMessage','answerCallbackQuery','reopenForumTopic','setMyCommands'}
+IDEMPOTENT = READ_METHODS | {'editMessageText','editMessageCaption','editMessageMedia','editMessageReplyMarkup','setMessageReaction','deleteMessage','answerCallbackQuery','reopenForumTopic','setMyCommands'}
 
 
 class Telegram:

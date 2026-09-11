@@ -122,3 +122,123 @@ async def test_session_store_roundtrip(db):
     assert await store.load_session() is not None
     await store.delete_session('new-token')
     assert await store.load_session() is None
+
+
+@pytest.mark.asyncio
+async def test_album_buffer_survives_restart_and_deduplicates_members(db):
+    from maxost.content import from_telegram
+    a = await account(db)
+    d = await db.dialog(a, 500, 600, 'Group')
+    def member(mid, text=''):
+        return from_telegram({'message_id': mid, 'caption': text, 'media_group_id': 'a1',
+            'photo': [{'file_id': str(mid)}]}, 100000)[0]
+    await asyncio.gather(*(db.collect_album(d, 'a1', mid, member(mid), 1) for mid in (12, 11)))
+    await db.collect_album(d, 'a1', 11, member(11), 1)
+    assert await db.pool.fetchval('SELECT generation FROM albums') == 2
+    raw = bytes(await db.pool.fetchval('SELECT body FROM albums'))
+    assert b'file_id' not in raw
+    # A newly constructed service shares only persisted state with its predecessor.
+    restarted = Database(db.pool, db.vault)
+    await db.pool.execute("UPDATE albums SET ready_at=now()-interval '1 second'")
+    await asyncio.gather(restarted.flush_albums(), db.flush_albums())
+    job = await db.claim()
+    assert job['source_id'] == 'album:a1'
+    assert db.payload(job)['tg_ids'] == [11, 12]
+    assert len(db.payload(job)['attachments']) == 2
+    await db.complete(job)
+    await db.collect_album(d, 'a1', 11, member(11, 'new caption'), 2)
+    await db.collect_album(d, 'a1', 11, member(11, 'stale'), 1)
+    await db.pool.execute("UPDATE albums SET ready_at=now()-interval '1 second'")
+    edit = await db.claim()
+    assert edit['action'] == 'edit'
+    assert db.payload(edit)['parts'][0]['text'] == 'new caption'
+    assert await db.pool.fetchval('SELECT count(*) FROM jobs') == 2
+
+
+@pytest.mark.asyncio
+async def test_album_one_to_many_links_edit_and_encrypted_checkpoints(db):
+    import asyncpg
+    a = await account(db)
+    await account(db, 102, '+79990000102')
+    d = await db.dialog(a, 500, 600, 'Group')
+    await db.enqueue(d, 'tg', 'send', '55', '', [{'text': ''}])
+    job = await db.claim()
+    pairs = [{'tg': 21+n, 'max': '55', 'kind': 'photo', 'part': n, 'album': 'album9', 'media_tag': 'hash'} for n in range(3)]
+    await db.save_links(job, pairs)
+    await db.save_links(job, pairs)
+    assert len(await db.links(d, 'max', '55')) == 3
+    await db.save_step(job, 'send:0', {'ids': [21, 22, 23], 'secret': 'checkpoint-private'})
+    assert (await db.saved_step(job, 'send:0'))['ids'] == [21, 22, 23]
+    assert b'checkpoint-private' not in bytes(await db.pool.fetchval('SELECT result FROM delivery_steps'))
+    assert await db.saved_step({**dict(job), 'owner': 102}, 'send:0') is None
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await db.save_step({**dict(job), 'owner': 102}, 'other', {'bad': True})
+    await db.complete(job)
+    await db.enqueue(d, 'tg', 'edit', '55', 'v2', [{'parts': [{'text': 'new'}]}])
+    edit = await db.claim()
+    await db.save_links(edit, pairs)
+    assert len(await db.source_links(d, 'max', '55')) == 3
+    rows = await db.source_links(d, 'max', '55')
+    assert all(row['job_id'] == edit['id'] for row in rows)
+    assert rows[0]['media_tag'] == 'hash'
+    await db.remove_link(d, rows[2]['id'])
+    assert len(await db.links(d, 'max', '55')) == 2
+
+
+@pytest.mark.asyncio
+async def test_content_cards_owner_fk_and_token_revocation(db):
+    import asyncpg
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from maxost.max_client import MaxHub, Connection
+    a = await account(db)
+    await account(db, 102, '+79990000102')
+    d = await db.dialog(a, 1, 2, 'A')
+    data = {'title': 'private poll', 'answers': []}
+    card = await db.put_card(d, '44', 'poll', data)
+    assert db.card_data(card) == data
+    assert b'private poll' not in bytes(card['data'])
+    with pytest.raises(asyncpg.ForeignKeyViolationError):
+        await db.put_card({**dict(d), 'owner': 102}, '44', 'poll', data)
+    await db.pool.execute('UPDATE accounts SET session_cipher=$2 WHERE id=$1', a['id'], b'old token')
+    hub = MaxHub(db, SimpleNamespace())
+    entry = Connection(a, client=SimpleNamespace(close=AsyncMock()))
+    entry.ready.set()
+    await hub.reauth(entry)
+    current = await db.account(101)
+    assert current['status'] == 'reauth' and current['session_cipher'] is None
+    assert current['reauth_notified'] is False and entry.closing
+    entry.client.close.assert_awaited_once()
+    await db.pool.execute('UPDATE accounts SET reauth_notified=true WHERE id=$1', a['id'])
+    await hub.reauth(entry)
+    assert (await db.account(101))['reauth_notified'] is True
+    # Restart must not resume this account or issue SMS.
+    await db.recover()
+    await hub.restore()
+    assert a['id'] not in hub.connections
+    await hub.close()
+
+
+@pytest.mark.asyncio
+async def test_v01_rows_survive_forward_migration(db):
+    from pathlib import Path
+    schema = 'upgrade_' + uuid.uuid4().hex
+    async with db.pool.acquire() as c:
+        await c.execute(f'CREATE SCHEMA {schema}')
+        try:
+            await c.execute(f'SET search_path TO {schema}')
+            root = Path(__file__).parents[1] / 'maxost' / 'migrations'
+            await c.execute((root / '001_initial.sql').read_text())
+            aid, did = uuid.uuid4(), uuid.uuid4()
+            await c.execute('INSERT INTO users(id) VALUES(1)')
+            await c.execute("INSERT INTO accounts(id,owner,phone_hash,phone_cipher,since_ms,history_ms) VALUES($1,1,'h',$2,0,0)", aid, b'encrypted')
+            await c.execute('INSERT INTO dialogs(id,account_id,owner,max_chat_id,title_cipher) VALUES($1,$2,1,20,$3)', did, aid, b'title')
+            jid = await c.fetchval("INSERT INTO jobs(owner,dialog_id,direction,action,source_id,part) VALUES(1,$1,'tg','send','40',2) RETURNING id", did)
+            await c.execute("INSERT INTO message_links(job_id,owner,dialog_id,tg_message_id,max_message_id,part,origin) VALUES($1,1,$2,30,'40',2,'max')", jid, did)
+            await c.execute((root / '002_content.sql').read_text())
+            row = await c.fetchrow('SELECT * FROM message_links')
+            assert row['source_key'] == '40' and row['part'] == 2
+            assert row['tg_message_id'] == 30 and row['max_message_id'] == '40'
+        finally:
+            await c.execute('RESET search_path')
+            await c.execute(f'DROP SCHEMA {schema} CASCADE')

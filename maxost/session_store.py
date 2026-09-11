@@ -15,7 +15,7 @@ class PostgresSessionStore:
     async def save_session(self, session_info):
         envelope = self.db.vault.seal(self.owner, self.purpose, session_info.model_dump(mode='json'))
         result = await self.db.pool.execute(
-            'UPDATE accounts SET session_cipher=$3 WHERE id=$1 AND owner=$2',
+            "UPDATE accounts SET session_cipher=$3 WHERE id=$1 AND owner=$2 AND status NOT IN ('reauth','paused')",
             self.account_id, self.owner, envelope)
         if result != 'UPDATE 1':
             raise Rejected('Сессия отключена владельцем.')
