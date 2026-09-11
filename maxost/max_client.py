@@ -7,6 +7,7 @@ import logging
 from dataclasses import dataclass, field
 
 from .errors import Rejected, RetryLater, Uncertain
+from .max_auth import InteractiveLogin
 from .session_store import PostgresSessionStore
 
 log = logging.getLogger(__name__)
@@ -53,7 +54,7 @@ class MaxHub:
         client = Client(
             phone=phone, work_dir='/tmp',
             sms_code_provider=provider, password_provider=provider,
-            auth_flow=None if provider else NoInteractiveLogin(),
+            auth_flow=InteractiveLogin(provider) if provider else NoInteractiveLogin(),
             extra_config=ExtraConfig(
                 store=PostgresSessionStore(self.db, a['id'], a['owner']),
                 persist_session=True, reconnect=False, relogin=False,
@@ -110,17 +111,18 @@ class MaxHub:
     async def authenticate(self, account, provider):
         entry = Connection(account)
         self.connections[account['id']] = entry
-        entry.client = self.build(entry, provider)
         try:
+            entry.client = self.build(entry, provider)
             await entry.client.connect()
             await self.identify(entry)
         except BaseException:
             # A successfully issued but unbound session must not remain running.
             with contextlib.suppress(Exception):
-                if entry.client.is_connected:
+                if entry.client and entry.client.is_connected:
                     await entry.client.logout()
             with contextlib.suppress(Exception):
-                await entry.client.close()
+                if entry.client:
+                    await entry.client.close()
             self.connections.pop(account['id'], None)
             raise
         entry.task = asyncio.create_task(self.monitor(entry, connected=True))
@@ -206,6 +208,8 @@ class MaxHub:
         if not account:
             return True
         entry = self.connections.get(account['id'])
+        if entry:
+            entry.closing = True
         await self.db.pool.execute("UPDATE accounts SET status='paused' WHERE id=$1 AND owner=$2", account['id'], owner)
         revoked = False
         if entry:

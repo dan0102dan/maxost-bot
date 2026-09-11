@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import time
 
+from .auth_diagnostics import STAGES, describe_failure, safe_error_code
 from .errors import BridgeError, Rejected, RetryLater
 from .telegram import TelegramRejected
 from .ui import Screen, apply_key, card, fallback, valid_callback, validate_phone
@@ -15,6 +17,22 @@ log = logging.getLogger(__name__)
 class Providers:
     def __init__(self, auth, screen):
         self.auth, self.screen = auth, screen
+        self.input_ready = asyncio.Event()
+
+    async def progress(self, stage, notice=None):
+        s = self.screen
+        if self.auth.screens.get(s.owner) is not s:
+            raise Rejected('Вход отменён.')
+        if stage not in STAGES:
+            raise ValueError('Unknown authentication stage')
+        s.auth_stage = stage
+        s.notice = notice or STAGES[stage]
+        log.info('MAX auth attempt=%s stage=%s', s.trace_id, stage)
+        self.auth.refresh(s)
+
+    async def code_requested(self, length):
+        self.screen.code_length = length
+        await self.progress('waiting_code')
 
     async def request(self, phase):
         s = self.screen
@@ -22,12 +40,16 @@ class Providers:
             raise Rejected('Вход отменён.')
         async with s.lock:
             s.phase, s.buffer = phase, ''
+            s.auth_stage = 'waiting_code' if phase == 'code' else 'waiting_password'
             s.future = asyncio.get_running_loop().create_future()
             future = s.future
-        await self.auth.render(s)
         try:
+            await self.auth.render(s)
+            self.input_ready.set()
             return await asyncio.wait_for(future, max(0.1, s.expires-time.monotonic()))
         finally:
+            if not future.done():
+                future.cancel()
             if s.future is future:
                 s.future = None
             s.buffer = ''
@@ -151,10 +173,14 @@ class Authentication:
                 elif s.phase=='phone' and key=='submit':
                     s.phone = validate_phone(s.buffer)
                     s.buffer, s.phase = '', 'requesting'
+                    s.auth_stage, s.notice = 'connecting', STAGES['connecting']
+                    s.trace_id = secrets.token_hex(4)
                     s.task = asyncio.create_task(self._login(s))
                 elif s.phase=='code' and key=='submit':
-                    if not s.buffer.isascii() or not s.buffer.isdecimal() or not 4<=len(s.buffer)<=8:
-                        raise Rejected('Введите 4–8 цифр кода и нажмите «Войти в MAX».')
+                    length_ok = len(s.buffer) == s.code_length if s.code_length else 4 <= len(s.buffer) <= 8
+                    if not s.buffer.isascii() or not s.buffer.isdecimal() or not length_ok:
+                        expected = str(s.code_length) if s.code_length else '4–8'
+                        raise Rejected(f'Введите {expected} цифр кода и нажмите «Войти в MAX».')
                     if s.future and not s.future.done():
                         value, s.buffer, s.phase = s.buffer, '', 'checking'
                         s.future.set_result(value)
@@ -188,23 +214,46 @@ class Authentication:
         return True
 
     async def _login(self,s):
+        login_task = waiter = None
         try:
+            log.info('MAX auth attempt=%s stage=account_setup', s.trace_id)
             account = await self.db.new_account(s.owner,s.phone,self.settings.max_accounts)
             s.account_id=account['id']
+            provider = Providers(self,s)
             async with asyncio.timeout(max(0.1,s.expires-time.monotonic())):
-                await self.hub.authenticate(account,Providers(self,s))
+                await provider.progress('connecting')
+                login_task = asyncio.create_task(self.hub.authenticate(account,provider))
+                waiter = asyncio.create_task(provider.input_ready.wait())
+                done, _ = await asyncio.wait(
+                    (login_task, waiter), timeout=45, return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    raise TimeoutError('MAX initial connection timed out')
+                await login_task
             s.phase,s.account_id='ready',None
+            log.info('MAX auth attempt=%s stage=ready', s.trace_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            log.warning('MAX authorization failed (%s)',type(exc).__name__)
+            category, description = describe_failure(exc, s.auth_stage)
+            code = safe_error_code(exc)
+            log.warning('MAX auth attempt=%s stage=%s category=%s code=%s',
+                        s.trace_id, s.auth_stage, category, code)
             s.phase='error'
-            s.notice=str(exc) if isinstance(exc,BridgeError) else 'Не удалось войти. Проверьте номер и код; повторите /connect. Если включена 2FA, потребуется её пароль.'
+            s.notice = str(exc) if isinstance(exc,BridgeError) else description
+            s.notice += f'\nДиагностика: {category} / {code}. Попытка: {s.trace_id}. /connect — начать заново.'
         finally:
+            for task in (waiter, login_task):
+                if task and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(t for t in (waiter, login_task) if t), return_exceptions=True)
             s.wipe()
-            if s.account_id:
-                await self.db.pool.execute("DELETE FROM accounts WHERE id=$1 AND owner=$2 AND status='authorizing'",s.account_id,s.owner)
-                s.account_id=None
+            try:
+                if s.account_id:
+                    await self.db.pool.execute("DELETE FROM accounts WHERE id=$1 AND owner=$2 AND status='authorizing'",s.account_id,s.owner)
+                    s.account_id=None
+            except Exception:
+                # Still publish the diagnostic screen if the DB is unavailable.
+                log.warning('MAX auth attempt=%s stage=cleanup category=DATABASE', s.trace_id)
             if self.screens.get(s.owner) is s:
                 self.refresh(s)
 

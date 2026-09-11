@@ -23,6 +23,9 @@ class Screen:
     seen: set[str] = field(default_factory=set,repr=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock,repr=False)
     notice: str = ''
+    auth_stage: str = 'connecting'
+    trace_id: str = field(default_factory=lambda: secrets.token_hex(4))
+    code_length: int | None = None
     task: asyncio.Task | None = field(default=None,repr=False)
 
     def wipe(self):
@@ -70,8 +73,8 @@ def card(screen: Screen) -> dict:
     elif phase in ('phone','code'):
         phone = phase == 'phone'
         title = '01 / Номер телефона' if phone else '02 / Подтверждение входа'
-        display = '+'+screen.buffer+'▏' if phone else ' '.join('●' for _ in screen.buffer) + '  _' * max(0,6-len(screen.buffer))
-        hint = 'Введите номер с кодом страны, без +. Например: 7… или 375…' if phone else f'Введите SMS-код для номера …{screen.phone[-4:]}. Код не появится в истории чата.'
+        display = '+'+screen.buffer+'▏' if phone else ' '.join('●' for _ in screen.buffer) + '  _' * max(0,(screen.code_length or 6)-len(screen.buffer))
+        hint = 'Введите номер с кодом страны, без +. Например: 7… или 375…' if phone else f'Введите код подтверждения для номера …{screen.phone[-4:]}. Код скрыт на экране и не сохраняется в базе.'
         blocks += [paragraph({'type':'bold','text':title}),{'type':'pre','text':display},paragraph(hint)]
         if screen.notice:
             blocks.append(paragraph(screen.notice))
@@ -87,7 +90,7 @@ def card(screen: Screen) -> dict:
     elif phase=='disconnecting':
         blocks += [paragraph('Отключаем сессию и удаляем данные сервиса…')]
     elif phase in ('requesting','checking'):
-        blocks += [paragraph('Подключаемся к MAX…' if phase=='requesting' else 'Проверяем подтверждение…'),
+        blocks += [paragraph(screen.notice or ('Подключаемся к MAX…' if phase=='requesting' else 'Проверяем подтверждение…')),
             row([button('Отмена',prefix+'cancel','danger')])]
     elif phase == 'ready':
         blocks += [paragraph({'type':'bold','text':'✓ Аккаунт подключён'}),
@@ -151,7 +154,7 @@ def apply_key(screen, key):
     if screen.phase not in ('phone','code'):
         return
     if key in '0123456789' and len(key)==1:
-        if len(screen.buffer) < (15 if screen.phase=='phone' else 8):
+        if len(screen.buffer) < (15 if screen.phase=='phone' else (screen.code_length or 8)):
             screen.buffer += key
     elif key=='back':
         screen.buffer = screen.buffer[:-1]
