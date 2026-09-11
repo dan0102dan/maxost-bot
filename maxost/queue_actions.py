@@ -33,7 +33,12 @@ def error_text(job, confirm=False):
             f"Не удалось подтвердить отправку №{job['id']} в {destination}.\n"
             'Проверьте чат: сообщение могло дойти.'
         )
-    return f"Не удалось отправить сообщение №{job['id']} в {destination}."
+    text = f"Не удалось отправить сообщение №{job['id']} в {destination}."
+    # Keep actionable causes (for example /bind), but only in this private notice.
+    detail = ' '.join(str(job.get('error') or '').split())
+    if detail:
+        text += '\n' + (detail if len(detail) <= 240 else detail[:239] + '…')
+    return text
 
 
 class QueueActions:
