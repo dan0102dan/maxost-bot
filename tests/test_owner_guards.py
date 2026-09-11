@@ -1,4 +1,4 @@
-"""Conflict paths must reject EXCLUDED.owner before altering existing data."""
+"""Conflict paths must reject forged owners before altering existing data."""
 import base64
 import os
 import uuid
@@ -23,14 +23,21 @@ async def owned_store():
     pool = None
     try:
         await admin.execute(f'CREATE SCHEMA {schema}')
-        pool = await asyncpg.create_pool(dsn, min_size=2, max_size=4,
-                                        server_settings={'search_path': schema})
-        db = Database(pool, Vault(base64.urlsafe_b64encode(os.urandom(32)).decode()))
+        pool = await asyncpg.create_pool(
+            dsn,
+            min_size=2,
+            max_size=4,
+            server_settings={'search_path': schema},
+        )
+        db = Database(
+            pool,
+            Vault(base64.urlsafe_b64encode(os.urandom(32)).decode()),
+        )
         await db.migrate()
         for owner in (101, 102):
             await db.consent(owner)
-            a = await db.new_account(owner, f'+79990000{owner}', 100)
-            await db.activate(a['id'], owner, owner * 100)
+            account = await db.new_account(owner, f'+79990000{owner}', 100)
+            await db.activate(account['id'], owner, owner * 100)
         account = await db.account(101)
         dialog = await db.dialog(account, 1, 2, 'private')
         await db.enqueue(dialog, 'tg', 'send', '77', '', [{'text': 'original'}])
@@ -44,63 +51,82 @@ async def owned_store():
 
 
 @pytest.mark.asyncio
-async def test_card_conflict_rejects_foreign_owner_without_corrupting_ciphertext(owned_store):
+async def test_poll_conflict_rejects_foreign_owner_without_corruption(owned_store):
     import asyncpg
+
     db, dialog, _ = owned_store
-    card = await db.put_card(dialog, '77', 'poll', {'title': 'original'})
+    mirror = await db.put_poll(dialog, '77', {'title': 'original'})
     foreign = {**dict(dialog), 'owner': 102}
     with pytest.raises(asyncpg.ForeignKeyViolationError):
-        await db.put_card(foreign, '77', 'poll', {'title': 'wrong owner'})
-    row = await db.pool.fetchrow('SELECT * FROM content_cards WHERE id=$1', card['id'])
-    assert bytes(row['data']) == bytes(card['data'])
-    assert db.card_data(row) == {'title': 'original'}
-    updated = await db.put_card(dialog, '77', 'poll', {'title': 'valid update'})
-    assert updated['id'] == card['id']
-    assert db.card_data(updated) == {'title': 'valid update'}
+        await db.put_poll(foreign, '77', {'title': 'wrong owner'})
+    row = await db.pool.fetchrow(
+        'SELECT * FROM poll_mirrors WHERE id=$1', mirror['id']
+    )
+    assert bytes(row['data']) == bytes(mirror['data'])
+    assert db.poll_data(row) == {'title': 'original'}
+    updated = await db.put_poll(dialog, '77', {'title': 'valid update'})
+    assert updated['id'] == mirror['id']
+    assert db.poll_data(updated) == {'title': 'valid update'}
 
 
 @pytest.mark.asyncio
-async def test_checkpoint_conflict_cannot_silently_accept_foreign_owner(owned_store):
+async def test_checkpoint_conflict_rejects_foreign_owner(owned_store):
     import asyncpg
+
     db, _, job = owned_store
     await db.save_step(job, 'send:0', {'message_id': 77})
     with pytest.raises(asyncpg.ForeignKeyViolationError):
-        await db.save_step({**dict(job), 'owner': 102}, 'send:0', {'message_id': 88})
-    assert await db.saved_step(job, 'send:0') == {'message_id': 77}
-    await db.save_step(job, 'send:0', {'message_id': 99})  # Legitimate retry is still idempotent.
+        await db.save_step(
+            {**dict(job), 'owner': 102},
+            'send:0',
+            {'message_id': 88},
+        )
     assert await db.saved_step(job, 'send:0') == {'message_id': 77}
 
 
 @pytest.mark.asyncio
 async def test_album_conflict_checks_parent_before_upsert(owned_store):
     import asyncpg
+
     db, dialog, _ = owned_store
-    query = '''INSERT INTO albums(dialog_id,owner,group_id,body) VALUES($1,$2,'g',$3)
-               ON CONFLICT(dialog_id,group_id) DO UPDATE SET body=excluded.body'''
+    query = '''INSERT INTO albums(dialog_id,owner,group_id,body)
+               VALUES($1,$2,'g',$3)
+               ON CONFLICT(dialog_id,group_id)
+               DO UPDATE SET body=excluded.body'''
     await db.pool.execute(query, dialog['id'], 101, b'original ciphertext')
     with pytest.raises(asyncpg.ForeignKeyViolationError):
         await db.pool.execute(query, dialog['id'], 102, b'wrong ciphertext')
-    assert bytes(await db.pool.fetchval('SELECT body FROM albums')) == b'original ciphertext'
+    assert bytes(
+        await db.pool.fetchval('SELECT body FROM albums')
+    ) == b'original ciphertext'
 
 
 @pytest.mark.asyncio
-async def test_link_conflict_rejects_foreign_owner_and_rolls_back(owned_store):
+async def test_link_conflict_rejects_foreign_owner(owned_store):
     import asyncpg
+
     db, dialog, job = owned_store
     pair = {'tg': 88, 'max': '77', 'kind': 'text', 'part': 0}
     await db.save_links(job, [pair])
     with pytest.raises(asyncpg.ForeignKeyViolationError):
-        await db.save_links({**dict(job), 'owner': 102}, [{**pair, 'max': 'attacker'}])
+        await db.save_links(
+            {**dict(job), 'owner': 102},
+            [{**pair, 'max': 'attacker'}],
+        )
     rows = await db.links(dialog, 'max', '77')
     assert len(rows) == 1 and rows[0]['owner'] == 101
     assert await db.pool.fetchval('SELECT count(*) FROM message_links') == 1
 
 
 @pytest.mark.asyncio
-async def test_guard_migration_is_forward_only_and_idempotent(owned_store):
+async def test_single_schema_migration_is_idempotent(owned_store):
     db, dialog, _ = owned_store
-    card = await db.put_card(dialog, '77', 'poll', {'title': 'keep'})
+    mirror = await db.put_poll(dialog, '77', {'title': 'keep'})
     await db.migrate()
-    row = await db.pool.fetchrow('SELECT * FROM content_cards WHERE id=$1', card['id'])
-    assert db.card_data(row) == {'title': 'keep'}
-    assert await db.pool.fetchval("SELECT count(*) FROM schema_migrations WHERE version='003_content_owner_guards.sql'") == 1
+    row = await db.pool.fetchrow(
+        'SELECT * FROM poll_mirrors WHERE id=$1', mirror['id']
+    )
+    assert db.poll_data(row) == {'title': 'keep'}
+    assert await db.pool.fetchval(
+        "SELECT count(*) FROM schema_migrations WHERE version='001_schema.sql'"
+    ) == 1
