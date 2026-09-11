@@ -5,10 +5,10 @@ import contextlib
 import logging
 import signal
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 from .auth import Authentication
+from .bot_text import HELP, status_text
 from .bridge import Bridge
 from .config import Settings
 from .content import is_private_update
@@ -20,7 +20,7 @@ from .media import Media
 from .telegram import Telegram
 
 log=logging.getLogger(__name__)
-HELP='MAXOST · MAX ↔ Telegram\n\n/connect — подключить MAX\n/status — соединение и очередь\n/disconnect — отключить аккаунт и удалить данные\n/cancel — отменить вход\n/react — реакции (ответом на сообщение)\n/poll — результаты опроса (ответом на сообщение)\n/delete — удалить своё сообщение в MAX (ответом)\n/retry N — повторить ошибку; /retry N confirm — подтвердить риск дубля\n/skip N — пропустить задание\n/bind UUID — восстановить привязку в теме\n\nДиалог, группа или канал MAX = отдельная тема. В каналах публикация доступна только с правами MAX.\nПоддерживаются медиа, альбомы, стикеры, опросы и форматирование. Голосуйте кнопками карточки: голоса отправляются в исходный опрос MAX.\nНаписанное вами в MAX намеренно не дублируется. История до первого подключения не импортируется. Typing/read receipts не передаются.\n/help — эта справка. Мы не сотрудники MAX или Telegram.'
+
 
 
 class Application:
@@ -39,16 +39,14 @@ class Application:
         if not a:
             await self.tg.text(owner,'MAX не подключён. /connect',thread)
             return
-        states={'connected':'подключён','offline':'переподключение','reauth':'нужен повторный вход','authorizing':'вход в процессе','paused':'приостановлен'}
-        rows=await self.db.pool.fetch('SELECT status,count(*) AS n FROM jobs WHERE owner=$1 GROUP BY status',owner)
-        counts={r['status']:r['n'] for r in rows}
-        failed=await self.db.pool.fetch("SELECT id,status FROM jobs WHERE owner=$1 AND status IN ('failed','unknown') ORDER BY id LIMIT 10",owner)
-        checkpoint=datetime.fromtimestamp(a['history_ms']/1000,timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-        text=f"MAX: {states[a['status']]}\nВ очереди: {counts.get('pending',0)}\nОшибки: {counts.get('failed',0)}\nНеизвестный результат: {counts.get('unknown',0)}\nПроверка истории: {checkpoint}"
-        if failed:
-            text+='\nЗадания: '+', '.join(f"#{r['id']} ({r['status']})" for r in failed)
-        text+='\n/status обновляет сведения. /help — управление очередью.'
-        await self.tg.text(owner,text,thread)
+        rows = await self.db.pool.fetch(
+            'SELECT status,count(*) AS n FROM jobs WHERE owner=$1 GROUP BY status', owner)
+        counts = {r['status']: r['n'] for r in rows}
+        failed = []
+        if counts.get('failed') or counts.get('unknown'):
+            failed = await self.db.pool.fetch(
+                "SELECT id,status FROM jobs WHERE owner=$1 AND status IN ('failed','unknown') ORDER BY id LIMIT 10", owner)
+        await self.tg.text(owner, status_text(a['status'], counts, failed), thread)
 
     async def command(self,owner,text,message=None):
         args=text.split()
@@ -75,12 +73,12 @@ class Application:
             except (ValueError,IndexError):
                 raise Rejected('Укажите номер задания: /retry 123 или /skip 123.') from None
             await self.db.queue_control(owner,jid,command[1:],len(args)>2 and args[2]=='confirm')
-            await self.tg.text(owner,'Состояние задания обновлено.',thread)
+            await self.tg.text(owner,'Повторяем отправку.' if command == '/retry' else 'Сообщение пропущено.',thread)
         elif command=='/bind':
             if len(args)!=2:
-                raise Rejected('Формат: /bind UUID — внутри нужной темы.')
+                raise Rejected('Отправьте /bind UUID в нужном топике.')
             await self.bridge.bind(owner,args[1],thread)
-            await self.tg.text(owner,'Тема привязана. Теперь повторите остановленное задание командой /retry N.',thread)
+            await self.tg.text(owner,'Топик привязан. Повторить отправку: /retry N.',thread)
         elif command in ('/react', '/poll'):
             await self.bridge.interactions.command(owner, message or {}, 'reaction' if command == '/react' else 'poll_refresh')
         elif command=='/delete':
@@ -93,14 +91,17 @@ class Application:
     async def handle(self,update):
         if 'callback_query' in update:
             q=update['callback_query']
-            with contextlib.suppress(BridgeError):
-                await self.tg.call('answerCallbackQuery',{'callback_query_id':q['id']})
             owner=q.get('from',{}).get('id')
             msg=q.get('message',{})
             if not self.allowed(owner) or msg.get('chat',{}).get('type')!='private' or msg.get('chat',{}).get('id')!=owner:
                 return
             try:
                 data=q.get('data','')
+                if data.startswith('np:'):
+                    await self.bridge.interactions.native_polls.callback(q)
+                    return
+                with contextlib.suppress(BridgeError):
+                    await self.tg.call('answerCallbackQuery', {'callback_query_id': q['id']})
                 if data in ('nav:connect','nav:status','nav:help'):
                     await self.command(owner,'/'+data.split(':')[1])
                 elif data.startswith('c:'):
@@ -108,7 +109,21 @@ class Application:
                 else:
                     await self.auth.callback(q)
             except BridgeError as exc:
-                await self.tg.text(owner,str(exc))
+                if isinstance(exc, RetryLater):
+                    raise
+                with contextlib.suppress(BridgeError):
+                    await self.tg.call('answerCallbackQuery', {'callback_query_id': q['id'], 'text': str(exc)[:200], 'show_alert': True})
+                if not q.get('data', '').startswith('np:'):
+                    await self.tg.text(owner,str(exc))
+            return
+        if 'poll_answer' in update:
+            answer = {**update['poll_answer'], 'update_id': update['update_id']}
+            owner = answer.get('user', {}).get('id')
+            if self.allowed(owner):
+                try:
+                    await self.bridge.interactions.native_polls.answer(answer)
+                except Rejected as exc:
+                    await self.tg.text(owner, str(exc))
             return
         if 'message_reaction' in update:
             reaction = {**update['message_reaction'], 'update_id': update['update_id']}
@@ -144,7 +159,7 @@ class Application:
             if screen and screen.phase in ('consent','phone','requesting','code','checking'):
                 # Number and SMS text are never accepted through ordinary messages.
                 await self.tg.remove(owner,message['message_id'])
-                raise Rejected('Используйте кнопки на экране входа. Для отмены — /cancel.')
+                raise Rejected('Используйте кнопки входа. Отмена: /cancel.')
             await self.bridge.from_telegram(message,edited='edited_message' in update,event_id=update.get('update_id', 0))
         except Rejected as exc:
             await self.tg.text(owner,str(exc),message.get('message_thread_id'))
@@ -155,7 +170,7 @@ class Application:
             try:
                 updates=await self.tg.call('getUpdates',{
                     'offset':offset,'timeout':30,'limit':50,
-                    'allowed_updates':['message','edited_message','callback_query','my_chat_member','message_reaction']})
+                    'allowed_updates':['message','edited_message','callback_query','my_chat_member','message_reaction','poll_answer']})
                 for update in updates:
                     try:
                         await self.handle(update)
@@ -213,12 +228,10 @@ async def serve():
             raise RuntimeError('A webhook is configured. Remove it explicitly before using long polling')
         await tg.call('setMyCommands',{'commands':[
             {'command':'connect','description':'Подключить личный MAX'},
-            {'command':'status','description':'Соединение и очередь'},
+            {'command':'status','description':'Подключение'},
             {'command':'disconnect','description':'Отключить MAX и удалить данные'},
             {'command':'cancel','description':'Отменить ввод'},
             {'command':'help','description':'Справка'},
-            {'command':'react','description':'Реакции MAX (ответом на сообщение)'},
-            {'command':'poll','description':'Результаты опроса MAX (ответом)'},
         ]})
         await db.recover()
         await app.hub.restore()

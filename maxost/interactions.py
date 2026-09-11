@@ -1,4 +1,4 @@
-"""Owner-scoped reaction and poll cards; votes act on the original MAX object."""
+"""Owner-scoped interactions; votes act on the original MAX object."""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +11,8 @@ import uuid
 from .errors import Rejected
 from .formatting import value
 from .max_client import mutate
+from .native_polls import NativePolls, poll_signature
+from .native_reactions import mirror_reactions
 from .telegram import TelegramRejected
 
 EMOJI = ('👍', '❤️', '🔥', '😂', '👏', '😢', '👎')
@@ -37,16 +39,15 @@ def poll_view(card_id, poll):
         if not settings & 8:
             rows.append([{'text': ('☑ ' if answer.get('answer_id') in selected else '') + label[:80],
                           'callback_data': f'c:{card_id}:{version}:v:{index}'}])
-    lines.append(f"Всего голосов в MAX: {state.get('total', 0)}")
+    lines.append(f"Голосов в MAX: {state.get('total', 0)}")
     if settings & 8:
-        lines.append('Голосование закрыто.')
+        lines.append('Опрос закрыт.')
     else:
-        lines.append('Выбор отправляется в MAX от вашего аккаунта.')
         if settings & 2:
-            rows.append([{'text': 'Отправить выбор', 'callback_data': f'c:{card_id}:{version}:submit:0'}])
+            rows.append([{'text': 'Голосовать', 'callback_data': f'c:{card_id}:{version}:submit:0'}])
         if settings & 4:
             rows.append([{'text': 'Отозвать голос', 'callback_data': f'c:{card_id}:{version}:clear:0'}])
-    rows.append([{'text': 'Обновить результаты', 'callback_data': f'c:{card_id}:{version}:refresh:0'}])
+    rows.append([{'text': 'Обновить', 'callback_data': f'c:{card_id}:{version}:refresh:0'}])
     return '\n'.join(lines), {'inline_keyboard': rows}
 
 
@@ -63,10 +64,10 @@ def reaction_counts(info):
 
 
 def reaction_view(card_id, data):
-    text = 'Реакции MAX: ' + (' · '.join(f"{r['reaction']} {r['count']}" for r in data['counters']) or 'нет')
+    text = 'MAX · ' + (' · '.join(f"{r['reaction']} {r['count']}" for r in data['counters']) or 'нет реакций')
     rows = [[{'text': emoji, 'callback_data': f'c:{card_id}:reaction:r:{n}'} for n, emoji in enumerate(EMOJI[:4])],
             [{'text': emoji, 'callback_data': f'c:{card_id}:reaction:r:{n}'} for n, emoji in enumerate(EMOJI[4:], 4)],
-            [{'text': 'Убрать мою реакцию', 'callback_data': f'c:{card_id}:reaction:clear:0'}]]
+            [{'text': 'Убрать реакцию', 'callback_data': f'c:{card_id}:reaction:clear:0'}]]
     return text, {'inline_keyboard': rows}
 
 
@@ -74,6 +75,7 @@ class Interactions:
     def __init__(self, bridge):
         self.bridge, self.db, self.tg = bridge, bridge.db, bridge.tg
         self._locks = WeakValueDictionary()
+        self.native_polls = NativePolls(self)
 
     def lock(self, owner):
         lock = self._locks.get(owner)
@@ -97,10 +99,8 @@ class Interactions:
                     data.setdefault(key, before.get(key, []))
         card = await self.db.put_card(d, mid, kind, data)
         text, markup = poll_view(card['id'], data) if kind == 'poll' else reaction_view(card['id'], data)
-        # Telegram's text limit cannot represent an arbitrarily large MAX poll.
-        # Explicitly show the overflow instead of silently dropping options.
         if len(text.encode('utf-16-le')) // 2 > 4000:
-            raise Rejected('Опрос MAX слишком большой для карточки Telegram. Откройте оригинал в MAX.')
+            raise Rejected('Опрос слишком большой. Откройте его в MAX.')
         await self.tg.pace(d['owner'])
         if card['tg_message_id']:
             try:
@@ -118,7 +118,8 @@ class Interactions:
         return {'id': result['message_id'], 'kind': 'poll' if kind == 'poll' else 'text'}
 
     async def publish_poll(self, d, mid, poll, thread, reply):
-        return await self.publish(d, mid, 'poll', dict(poll), thread, reply)
+        async with self.lock(d['owner']):
+            return await self.native_polls.publish(d, mid, dict(poll), thread, reply)
 
     async def schedule(self, entry, chat_id, mid, action):
         d = await self.db.pool.fetchrow('SELECT * FROM dialogs WHERE account_id=$1 AND owner=$2 AND max_chat_id=$3', entry.account['id'], entry.account['owner'], chat_id)
@@ -134,10 +135,11 @@ class Interactions:
         tid = message.get('reply_to_message', {}).get('message_id')
         links = await self.db.links(d, 'tg', tid) if d and tid else []
         if not links:
-            raise Rejected('Отправьте команду ответом на сообщение, связанное с MAX, внутри его темы.')
+            raise Rejected('Ответьте на сообщение MAX в его топике.')
         return d, links[0]['max_message_id']
 
     async def command(self, owner, message, action):
+        # Backward compatibility for older clients; not advertised in the UI.
         d, mid = await self.target(owner, message)
         await self.db.enqueue(d, 'tg', action, mid, uuid.uuid4().hex, [{'force': True}])
 
@@ -152,16 +154,16 @@ class Interactions:
             if not 0 < cid < 2**63:
                 raise ValueError()
         except (ValueError, TypeError):
-            raise Rejected('Некорректная кнопка.') from None
+            raise Rejected('Кнопка устарела.') from None
         owner = q['from']['id']
         if q.get('message', {}).get('chat', {}).get('id') != owner or q['message']['chat'].get('type') != 'private':
-            raise Rejected('Кнопки доступны только владельцу в личном чате.')
+            raise Rejected('Кнопка недоступна.')
         card = await self.db.pool.fetchrow('SELECT * FROM content_cards WHERE id=$1 AND owner=$2', cid, owner)
         if not card or card['tg_message_id'] != q.get('message', {}).get('message_id'):
-            raise Rejected('Карточка устарела или принадлежит другому пользователю.')
+            raise Rejected('Кнопка устарела.')
         d = await self.db.pool.fetchrow('SELECT * FROM dialogs WHERE id=$1 AND owner=$2', card['dialog_id'], owner)
         if not d or d['tg_thread_id'] != q['message'].get('message_thread_id'):
-            raise Rejected('Карточка открыта не в своей теме.')
+            raise Rejected('Откройте сообщение в его топике.')
         data = self.db.card_data(card)
         mid = card['max_message_id']
         if card['kind'] == 'reactions':
@@ -174,7 +176,7 @@ class Interactions:
             await self.db.enqueue(d, 'max', 'react', mid, q['id'], [{'max_id': mid, 'emoji': emoji}])
             return
         if version != fingerprint(data):
-            raise Rejected('Опрос изменился. Используйте обновлённые кнопки.')
+            raise Rejected('Опрос изменился. Используйте новые кнопки.')
         if action == 'refresh':
             await self.db.enqueue(d, 'tg', 'poll_refresh', mid, q['id'], [{}])
             return
@@ -186,10 +188,8 @@ class Interactions:
                 raise Rejected('Неизвестный вариант ответа.')
             aid = data['answers'][index].get('answer_id')
             if aid is None:
-                raise Rejected('MAX не передал идентификатор варианта. Обновите опрос.')
+                raise Rejected('Обновите опрос.')
             if settings & 2:
-                # Polling is single-consumer; persisted callback IDs prevent a
-                # repeated update from toggling the same option twice.
                 if q['id'] not in data.get('_seen', []):
                     selected = set(data.get('_selected', []))
                     selected.symmetric_difference_update({aid})
@@ -203,12 +203,12 @@ class Interactions:
         elif action == 'clear' and settings & 4:
             answers = []
         else:
-            raise Rejected('Недоступное действие опроса.')
+            raise Rejected('Действие недоступно.')
         await self.db.enqueue(d, 'max', 'vote', mid, q['id'], [{'max_id': mid, 'poll_id': data['poll_id'], 'answer_ids': answers}])
 
     async def native_reaction(self, update):
         owner = update.get('user', {}).get('id')
-        if not owner or update.get('chat', {}).get('type') != 'private' or update['chat'].get('id') != owner:
+        if not owner or update.get('user', {}).get('is_bot') or update.get('chat', {}).get('type') != 'private' or update['chat'].get('id') != owner:
             return
         rows = await self.db.pool.fetch('SELECT d.*,l.max_message_id FROM message_links l JOIN dialogs d ON d.id=l.dialog_id AND d.owner=l.owner WHERE l.owner=$1 AND l.tg_message_id=$2 ORDER BY l.part LIMIT 1', owner, update['message_id'])
         if not rows:
@@ -216,7 +216,7 @@ class Interactions:
         d = rows[0]
         new = update.get('new_reaction', [])
         if len(new) > 1 or any(r['type'] != 'emoji' for r in new):
-            raise Rejected('В MAX переносится одна обычная emoji-реакция. Используйте /react ответом на сообщение.')
+            raise Rejected('Выберите одну обычную эмодзи-реакцию.')
         await self.db.enqueue(d, 'max', 'react', d['max_message_id'], str(update['update_id']),
             [{'max_id': d['max_message_id'], 'emoji': new[0]['emoji'] if new else None}])
 
@@ -238,9 +238,18 @@ class Interactions:
         if job['action'] == 'reaction':
             info = await entry.client.get_reactions(d['max_chat_id'], [int(mid)])
             counters = reaction_counts((info or {}).get(mid))
-            exists = await self.db.pool.fetchval("SELECT 1 FROM content_cards WHERE dialog_id=$1 AND owner=$2 AND kind='reactions' AND max_message_id=$3", d['id'], d['owner'], mid)
-            if counters or exists or p.get('force'):
-                await self.bridge.delivery.step(job, 'reaction-card', lambda: self.publish(d, mid, 'reactions', {'counters': counters}, d['tg_thread_id'], reply))
+            async def show_reactions():
+                native = await mirror_reactions(self.tg, d['owner'], reply, counters)
+                previous = await self.db.pool.fetchrow("SELECT * FROM content_cards WHERE dialog_id=$1 AND owner=$2 AND kind='reactions' AND max_message_id=$3", d['id'], d['owner'], mid)
+                if native and not p.get('force'):
+                    if previous and previous['tg_message_id']:
+                        if await self.tg.remove(d['owner'], previous['tg_message_id']):
+                            await self.db.pool.execute('DELETE FROM content_cards WHERE id=$1 AND owner=$2', previous['id'], d['owner'])
+                    return {'native': True}
+                if counters or previous or p.get('force'):
+                    return await self.publish(d, mid, 'reactions', {'counters': counters}, d['tg_thread_id'], reply)
+                return {'native': False}
+            await self.bridge.delivery.step(job, 'reaction-card', show_reactions)
             return
         message = await entry.client.get_message(d['max_chat_id'], int(mid))
         polls = [a for a in getattr(message, 'attaches', []) if value(value(a, 'type'), 'value', value(a, 'type')) == 'POLL']
@@ -249,8 +258,9 @@ class Interactions:
         poll = polls[0].model_dump(mode='json')
         if job['action'] == 'vote':
             valid_ids = {a['answer_id'] for a in poll['answers']}
-            if poll['poll_id'] != p['poll_id'] or not set(p['answer_ids']) <= valid_ids or int(poll['settings']) & 8:
-                raise Rejected('Опрос изменился или закрыт. Обновите карточку.')
+            if (poll['poll_id'] != p['poll_id'] or not set(p['answer_ids']) <= valid_ids or int(poll['settings']) & 8
+                    or p.get('native_signature') and p['native_signature'] != poll_signature(poll)):
+                raise Rejected('Опрос изменился или закрыт.')
             async def vote():
                 state = await mutate(entry.client, 'vote_poll', chat_id=d['max_chat_id'], message_id=int(mid), poll_id=p['poll_id'], answer_ids=p['answer_ids'])
                 return state.model_dump(mode='json')

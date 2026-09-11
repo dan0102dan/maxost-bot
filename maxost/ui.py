@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass, field
 
 from .errors import Rejected
+from .bot_text import auth_notice
 
 
 @dataclass
@@ -18,15 +19,15 @@ class Screen:
     phone: str = field(default='',repr=False)
     message_id: int | None = None
     qr_message_id: int | None = None
+    auth_stage: str = 'connecting'
+    trace_id: str = field(default_factory=lambda: secrets.token_hex(4))
+    code_length: int | None = None
     expires: float = field(default_factory=lambda:time.monotonic()+600)
     future: asyncio.Future | None = field(default=None,repr=False)
     account_id: object = None
     seen: set[str] = field(default_factory=set,repr=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock,repr=False)
     notice: str = ''
-    auth_stage: str = 'connecting'
-    trace_id: str = field(default_factory=lambda: secrets.token_hex(4))
-    code_length: int | None = None
     task: asyncio.Task | None = field(default=None,repr=False)
 
     def wipe(self):
@@ -54,154 +55,68 @@ def paragraph(text):
 
 def card(screen: Screen) -> dict:
     prefix = f'a:{screen.nonce}:{screen.phase}:'
-    blocks = [
-        {'type':'heading','size':2,'text':'MAXOST'},
-        {'type':'footer','text':'MAX ↔ Telegram · Ваши диалоги в одном месте'},
-        {'type':'divider'},
-    ]
+    blocks = [{'type': 'heading', 'size': 2, 'text': 'MAXOST'}]
     phase = screen.phase
     if phase == 'consent':
         blocks += [
-            paragraph({'type':'bold','text':'Подключите личный аккаунт MAX'}),
-            paragraph(
-                'Диалоги, группы и каналы появятся отдельными темами. '
-                'Ответы в Telegram отправляются от вашего имени в MAX.'
-            ),
-            {'type':'details','summary':'Что важно знать перед входом','is_open':True,'blocks':[
-                paragraph(
-                    'Это независимый сервис, не официальный продукт MAX или Telegram. '
-                    'Неофициальный клиент может перестать работать.'
-                ),
-                paragraph(
-                    'Сервис получает доступ к переписке и отправке сообщений. '
-                    'Сессия и очередь шифруются в базе, но оператор сервера '
-                    'технически имеет доступ к данным.'
-                ),
-                paragraph(
-                    'Подключайте только свой аккаунт. SMS-коды не сохраняются. '
-                    'Отключить сессию и удалить данные можно через /disconnect.'
-                ),
+            paragraph('Ваши чаты MAX — в топиках Telegram.'),
+            paragraph('Подключайте только свой аккаунт. Сервис получает доступ к переписке и отправляет сообщения от вашего имени.'),
+            {'type': 'details', 'summary': 'О подключении', 'is_open': False, 'blocks': [
+                paragraph('Неофициальный сервис. Возможны ограничения MAX. Сессии шифруются в БД, но оператор имеет технический доступ к данным.'),
+                paragraph('Отключить аккаунт и удалить данные: /disconnect.'),
             ]},
-            row([button('Подключить свой MAX',prefix+'accept','success')]),
+            row([button('Подключить MAX', prefix+'accept', 'success')]),
         ]
-    elif phase in ('phone','code'):
+    elif phase in ('phone', 'code'):
         phone = phase == 'phone'
-        title = '01 / Номер телефона' if phone else '02 / Подтверждение входа'
-        display = (
-            '+'+screen.buffer+'▏'
-            if phone
-            else ' '.join('●' for _ in screen.buffer)
-            + '  _' * max(0,(screen.code_length or 6)-len(screen.buffer))
-        )
-        hint = (
-            'Введите номер с кодом страны, без +. Например: 7… или 375…'
-            if phone
-            else f'Введите код для номера …{screen.phone[-4:]}. '
-            'Если код не приходит, переключитесь на QR.'
-        )
+        display = ('+'+screen.buffer+'▏' if phone else
+                   ' '.join('●' for _ in screen.buffer) + '  _' * max(0, (screen.code_length or 6)-len(screen.buffer)))
         blocks += [
-            paragraph({'type':'bold','text':title}),
-            {'type':'pre','text':display},
-            paragraph(hint),
+            paragraph('Номер телефона' if phone else f'Код для …{screen.phone[-4:]}'),
+            {'type': 'pre', 'text': display},
         ]
-        if screen.notice:
-            blocks.append(paragraph(screen.notice))
-        keys = [
-            ('1','1'),('2  ABC','2'),('3  DEF','3'),
-            ('4  GHI','4'),('5  JKL','5'),('6  MNO','6'),
-            ('7  PQRS','7'),('8  TUV','8'),('9  WXYZ','9'),
-            ('C','clear'),('0  +','0'),('⌫','back'),
-        ]
+        if phone:
+            blocks.append(paragraph('С кодом страны, без +. Например: 7… или 375…'))
+        elif screen.notice and 'Код не принят' in screen.notice:
+            blocks.append(paragraph('Код не принят. Попробуйте ещё раз.'))
+        keys = [('1', '1'), ('2  ABC', '2'), ('3  DEF', '3'),
+                ('4  GHI', '4'), ('5  JKL', '5'), ('6  MNO', '6'),
+                ('7  PQRS', '7'), ('8  TUV', '8'), ('9  WXYZ', '9'),
+                ('C', 'clear'), ('0  +', '0'), ('⌫', 'back')]
+        blocks += [row([button(label, prefix+key) for label, key in keys[n:n+3]]) for n in range(0, 12, 3)]
         blocks += [
-            row([button(label,prefix+key) for label,key in keys[n:n+3]])
-            for n in range(0,12,3)
+            row([button('Получить код' if phone else 'Войти в MAX', prefix+'submit', 'success')]),
+            row([button('Войти по QR' if phone else 'Нет кода? Войти по QR', prefix+'qr', 'primary')]),
+            row([button('Отмена', prefix+'cancel')]),
         ]
-        blocks.append(
-            row([
-                button(
-                    'Получить код' if phone else 'Войти в MAX',
-                    prefix+'submit',
-                    'success',
-                )
-            ])
-        )
-        blocks.append(
-            row([
-                button(
-                    'Войти по QR' if phone else 'Код не пришёл — войти по QR',
-                    prefix+'qr',
-                    'primary',
-                )
-            ])
-        )
-        blocks.append(row([button('Отмена',prefix+'cancel','danger')]))
     elif phase == 'qr':
-        blocks += [
-            paragraph({'type':'bold','text':'02 / Вход по QR'}),
-            paragraph(
-                'QR отправлен отдельным защищённым сообщением. '
-                'Откройте MAX → сканер QR и подтвердите вход. '
-                'На другом устройстве можно отсканировать код с экрана Telegram.'
-            ),
-        ]
-        if screen.notice:
-            blocks.append(paragraph(screen.notice))
-        blocks.append(row([button('Отмена',prefix+'cancel','danger')]))
+        blocks += [paragraph('Отсканируйте QR в MAX и подтвердите вход.'),
+                   row([button('Отмена', prefix+'cancel')])]
     elif phase == 'password':
-        blocks += [
-            paragraph({'type':'bold','text':'03 / Дополнительный пароль MAX'}),
-            paragraph(
-                'На аккаунте включена двухэтапная проверка. Отправьте пароль '
-                'следующим сообщением. Бот попытается сразу удалить его, '
-                'но Telegram уже получит текст. Пароль не сохраняется.'
-            ),
-            row([button('Отмена',prefix+'cancel','danger')]),
-        ]
-    elif phase=='disconnecting':
-        blocks += [paragraph('Отключаем сессию и удаляем данные сервиса…')]
-    elif phase in ('requesting','checking'):
-        blocks += [
-            paragraph(
-                screen.notice
-                or ('Подключаемся к MAX…' if phase=='requesting'
-                    else 'Проверяем подтверждение…')
-            ),
-            row([button('Отмена',prefix+'cancel','danger')]),
-        ]
+        blocks += [paragraph('Введите пароль двухэтапной проверки MAX.'),
+                   paragraph('Пришлите следующим сообщением. Бот попробует удалить его, но Telegram получит текст.'),
+                   row([button('Отмена', prefix+'cancel')])]
+    elif phase == 'disconnecting':
+        blocks.append(paragraph('Отключаем MAX…'))
+    elif phase in ('requesting', 'checking'):
+        stages = {'connecting': 'Подключаемся…', 'requesting_code': 'Запрашиваем код…',
+                  'requesting_qr': 'Создаём QR…', 'checking_code': 'Проверяем код…',
+                  'checking_password': 'Проверяем пароль…', 'confirming_qr': 'Проверяем вход…',
+                  'login': 'Завершаем подключение…'}
+        blocks += [paragraph(stages.get(screen.auth_stage, 'Подключаемся…')),
+                   row([button('Отмена', prefix+'cancel')])]
     elif phase == 'ready':
-        blocks += [
-            paragraph({'type':'bold','text':'✓ Аккаунт подключён'}),
-            paragraph(
-                'Новые сообщения MAX появятся в отдельных темах. '
-                'Отвечайте прямо в нужной теме.'
-            ),
-            paragraph('Старая переписка до подключения не импортируется.'),
-            row([
-                button('Состояние','nav:status','primary'),
-                button('Помощь','nav:help'),
-            ]),
-        ]
+        blocks += [paragraph({'type': 'bold', 'text': '✓ MAX подключён'}),
+                   paragraph('Отвечайте прямо в топике нужного чата.'),
+                   row([button('Статус', 'nav:status'), button('Помощь', 'nav:help')])]
     elif phase == 'disconnect':
-        blocks += [
-            paragraph('Отключить аккаунт и удалить данные сервиса?'),
-            paragraph(
-                'Будут удалены сессия, привязки тем и очередь. '
-                'Сообщения в Telegram и MAX останутся.'
-            ),
-            row([
-                button('Отключить и удалить',prefix+'confirm','danger'),
-                button('Отмена',prefix+'cancel'),
-            ]),
-        ]
+        blocks += [paragraph('Отключить MAX?'),
+                   paragraph('Сессия, привязки топиков и очередь будут удалены. Сообщения в чатах останутся.'),
+                   row([button('Отключить', prefix+'confirm', 'danger'), button('Отмена', prefix+'cancel')])]
     else:
-        blocks += [
-            paragraph(
-                screen.notice
-                or 'Вход завершён. Используйте /connect для новой попытки.'
-            ),
-            row([button('Подключить MAX','nav:connect','primary')]),
-        ]
-    return {'blocks':blocks,'skip_entity_detection':True}
+        blocks += [paragraph(auth_notice(screen) or 'Подключите MAX, чтобы начать.'),
+                   row([button('Подключить MAX', 'nav:connect', 'primary')])]
+    return {'blocks': blocks, 'skip_entity_detection': True}
 
 
 def fallback(rich):
@@ -227,18 +142,14 @@ def fallback(rich):
                     text = '<pre>'+text+'</pre>'
                 lines.append(text)
     walk(rich['blocks'])
-    return '\n\n'.join(lines), {'inline_keyboard':keyboard}
+    return '\n'.join(lines), {'inline_keyboard':keyboard}
 
 
 def valid_callback(screen, callback) -> str | None:
     msg = callback.get('message',{})
-    if (
-        callback.get('from',{}).get('id') != screen.owner
-        or msg.get('chat',{}).get('type')!='private'
-        or msg.get('chat',{}).get('id') != screen.owner
-        or msg.get('message_id') != screen.message_id
-        or time.monotonic()>screen.expires
-    ):
+    if (callback.get('from',{}).get('id') != screen.owner or msg.get('chat',{}).get('type')!='private'
+            or msg.get('chat',{}).get('id') != screen.owner or msg.get('message_id') != screen.message_id
+            or time.monotonic()>screen.expires):
         return None
     prefix = f'a:{screen.nonce}:{screen.phase}:'
     data = callback.get('data','')
@@ -255,9 +166,7 @@ def apply_key(screen, key):
     if screen.phase not in ('phone','code'):
         return
     if key in '0123456789' and len(key)==1:
-        if len(screen.buffer) < (
-            15 if screen.phase=='phone' else (screen.code_length or 8)
-        ):
+        if len(screen.buffer) < (15 if screen.phase=='phone' else (screen.code_length or 8)):
             screen.buffer += key
     elif key=='back':
         screen.buffer = screen.buffer[:-1]
@@ -266,14 +175,6 @@ def apply_key(screen, key):
 
 
 def validate_phone(digits):
-    if (
-        not digits.isascii()
-        or not digits.isdecimal()
-        or not 8 <= len(digits) <= 15
-        or digits[0]=='0'
-    ):
-        raise Rejected(
-            'Введите 8–15 цифр международного номера. '
-            'Первая цифра не должна быть нулём.'
-        )
+    if not digits.isascii() or not digits.isdecimal() or not 8 <= len(digits) <= 15 or digits[0]=='0':
+        raise Rejected('Введите 8–15 цифр международного номера. Первая цифра не должна быть нулём.')
     return '+'+digits

@@ -157,10 +157,10 @@ class Delivery:
             result = await self.step(job, f'max:{n}', lambda part=part, n=n, mid=mid: max_transport.transmit(entry.client, d['max_chat_id'], part, prepared if n == 0 else [], reply, mid))
             kind = 'media' if n == 0 and prepared else 'text'
             await self.db.save_links(job, [{'tg': tid, 'max': result['id'], 'kind': kind, 'part': n} for tid in tg_ids])
+            # The user's Telegram poll already exists. Do not echo another poll
+            # back into the same topic after creating its MAX counterpart.
             for poll in result.get('polls', []):
-                async def show(poll=poll, mid=result['id']):
-                    return await self.interactions.publish_poll(d, mid, poll, d['tg_thread_id'], tg_ids[0])
-                await self.step(job, f'max-poll:{n}:{poll["poll_id"]}', show)
+                await self.db.put_card(d, result['id'], 'poll', poll)
         for link in old:
             if link['part'] >= len(parts):
                 await self.delete_link(entry, d, job, link)
@@ -206,8 +206,7 @@ class Delivery:
             return await self.send_max(entry, d, job, p, await self.reply(d, job, p), old)
         units = tg_units(p)
         thread = await self.bridge.topic(d)
-        # Telegram has no "append to existing album" API. Rebuild only a group
-        # whose cardinality/type family changed; same-sized media are edited in place.
+        # Telegram has no append-to-album API. Same-sized media are edited in place.
         regroup = any(r.get('album_id') for r in old) and (
             len(units) != len(old) or any(category(u['kind']) != category(r['kind']) for u, r in zip(units, old)))
         if regroup:
