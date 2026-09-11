@@ -208,8 +208,8 @@ class Database(ContentStore):
         async with self.pool.acquire() as connection, connection.transaction():
             dialog = await connection.fetchrow(
                 '''SELECT d.id FROM dialogs d JOIN accounts a ON a.id=d.account_id
-                WHERE a.status IN ('connected','offline') AND EXISTS (
-                    SELECT 1 FROM jobs j
+                JOIN LATERAL (
+                    SELECT j.id FROM jobs j
                     WHERE j.dialog_id=d.id AND j.owner=d.owner
                     AND j.status='pending' AND j.available_at<=now()
                     AND NOT EXISTS (
@@ -219,8 +219,11 @@ class Database(ContentStore):
                     AND (j.direction='tg' OR NOT EXISTS (
                         SELECT 1 FROM jobs prev WHERE prev.dialog_id=j.dialog_id
                         AND prev.direction=j.direction AND prev.id<j.id
-                        AND prev.status NOT IN ('sent','skipped'))))
-                ORDER BY d.created_at,d.id FOR UPDATE OF d SKIP LOCKED LIMIT 1'''
+                        AND prev.status NOT IN ('sent','skipped')))
+                    ORDER BY j.id LIMIT 1
+                ) ready ON true
+                WHERE a.status IN ('connected','offline')
+                ORDER BY ready.id FOR UPDATE OF d SKIP LOCKED LIMIT 1'''
             )
             if dialog is None:
                 return None
