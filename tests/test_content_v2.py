@@ -352,7 +352,7 @@ async def test_telegram_album_is_one_max_message(monkeypatch):
     )
     from maxost import max_transport
 
-    prepare = AsyncMock(return_value=(['uploaded1', 'uploaded2'], []))
+    prepare = AsyncMock(return_value=['uploaded1', 'uploaded2'])
     transmit = AsyncMock(return_value={'id': 99, 'polls': []})
     monkeypatch.setattr(max_transport, 'prepare', prepare)
     monkeypatch.setattr(max_transport, 'transmit', transmit)

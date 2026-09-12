@@ -38,19 +38,12 @@ def test_status_shows_only_relevant_counters():
     assert 'истори' not in text.lower() and 'ошиб' not in text.lower()
 
 
-def test_unknown_delivery_keeps_explicit_duplicate_warning():
-    text = status_text(
-        'connected',
-        {'failed': 1, 'unknown': 1},
-        [
-            {'id': 42, 'status': 'failed'},
-            {'id': 50, 'status': 'unknown'},
-        ],
-    )
-    assert '/retry 42' in text
-    assert '/skip 50' in text
-    assert '/retry 50 confirm' in text
-    assert 'дубль' in text
+def test_status_points_to_buttons_instead_of_queue_commands():
+    text = status_text('connected', {'failed': 1, 'unknown': 1})
+    assert 'Не доставлено: 1' in text
+    assert 'Нужно проверить доставку: 1' in text
+    assert 'кнопками' in text
+    assert '/retry' not in text and '/skip' not in text
 
 
 @pytest.mark.parametrize(
@@ -79,7 +72,8 @@ def test_readme_has_no_pre_release_compatibility_content():
 
 
 def test_help_is_brief_and_has_no_legacy_commands():
-    assert '/react' not in HELP and '/poll' not in HELP and '/forget' not in HELP
+    for command in ('/react', '/poll', '/forget', '/retry', '/skip'):
+        assert command not in HELP
     assert len(HELP) < 400
 
 

@@ -10,6 +10,7 @@ import pytest_asyncio
 from maxost.crypto import Vault
 from maxost.db import Database
 from maxost.errors import Rejected
+from maxost.queue_actions import job_version
 
 pytestmark = pytest.mark.integration
 
@@ -81,7 +82,7 @@ async def test_unique_ingestion_and_parallel_claims(db):
 
 
 @pytest.mark.asyncio
-async def test_unknown_blocks_queue_and_requires_confirmation(db):
+async def test_unknown_blocks_outbound_queue_and_requires_confirmation(db):
     created = await account(db)
     dialog = await db.dialog(created, 1, 2, 'A')
     await db.enqueue(dialog, 'max', 'send', '10', '', [{'text': 'first'}])
@@ -90,11 +91,13 @@ async def test_unknown_blocks_queue_and_requires_confirmation(db):
     await db.mark_sending(job)
     await db.recover()
     assert await db.claim() is None
+    failed = await db.pool.fetchrow('SELECT * FROM jobs WHERE id=$1', job['id'])
+    expected = job_version(failed)
     with pytest.raises(Rejected):
-        await db.queue_control(102, job['id'], 'retry', True)
+        await db.queue_control(102, job['id'], 'retry', expected=expected, confirm=True)
     with pytest.raises(Rejected):
-        await db.queue_control(101, job['id'], 'retry')
-    await db.queue_control(101, job['id'], 'retry', True)
+        await db.queue_control(101, job['id'], 'retry', expected=expected)
+    await db.queue_control(101, job['id'], 'retry', expected=expected, confirm=True)
     assert (await db.claim())['id'] == job['id']
 
 
